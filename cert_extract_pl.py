@@ -484,15 +484,15 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "james_pl"
+        input_name = "znt_pl"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
     
     # Input/output directories
     # - pdf_dir: where PDFs live (e.g., encova/, nationwide/, hartford/, traveler/)
     # - output_dir: where extracted txt files are written (e.g., encovaop/, nationwideop/, ...)
-    pdf_dir = "encova"
-    output_dir = "encovaop"
+    pdf_dir = "traveler"
+    output_dir = "travelerop"
     
     # Extract base name
     base_name = extract_base_name(input_name)

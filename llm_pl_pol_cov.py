@@ -15,7 +15,7 @@ load_dotenv()
 
 
 class BuildingCoverageValidator:
-    """Validate Building coverage from certificate against policy"""
+    """Validate Building + BPP coverages from certificate against policy (single LLM call)"""
     
     def __init__(self, model: str = "gpt-4o-mini"):
         """
@@ -53,8 +53,49 @@ class BuildingCoverageValidator:
                 })
         
         return buildings
+
+    def extract_bpp_coverages(self, cert_data: Dict) -> List[Dict]:
+        """
+        Extract Business Personal Property (BPP) coverages from certificate.
+        Targets the main BPP limit (not off-premises/in-transit extensions).
+        """
+        coverages = cert_data.get("coverages", {}) or {}
+        bpps = []
+
+        for coverage_name, coverage_value in coverages.items():
+            name = (coverage_name or "").strip()
+            n = name.lower()
+
+            is_bpp = (
+                "business personal property" in n
+                or n == "bpp"
+                or n.startswith("bpp ")
+                or n.endswith(" bpp")
+            )
+
+            is_extension = any(
+                kw in n
+                for kw in [
+                    "off premises",
+                    "off-premises",
+                    "away from premises",
+                    "in transit",
+                    "transit",
+                    "portable storage",
+                    "temporarily",
+                    "newly acquired",
+                    "newly constructed",
+                    "coverage extension",
+                    "extension",
+                ]
+            )
+
+            if is_bpp and not is_extension:
+                bpps.append({"name": name, "value": coverage_value})
+
+        return bpps
     
-    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], policy_text: str) -> str:
+    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], policy_text: str) -> str:
         """
         Create validation prompt for Building coverages
         
@@ -72,22 +113,30 @@ class BuildingCoverageValidator:
         insured_name = cert_data.get("insured_name", "Not specified")
         policy_number = cert_data.get("policy_number", "Not specified")
         
-        prompt = f"""You are an expert Property Insurance QC Specialist validating Building coverage limits.
+        all_coverages = cert_data.get("coverages", {}) or {}
+
+        prompt = f"""You are an expert Property Insurance QC Specialist validating coverage limits.
 
 ==================================================
 CRITICAL INSTRUCTIONS
 ==================================================
 
 **YOUR TASK:**
-Validate BUILDING coverage limits from the certificate against the policy document.
+Validate BUILDING and Business Personal Property (BPP) coverage limits from the certificate against the policy document.
 
 **CONTEXT FROM CERTIFICATE:**
 - Insured Name: {insured_name}
 - Policy Number: {policy_number}
 - Location Address: {location_address}
 
+**ALL CERTIFICATE COVERAGES (for context):**
+{json.dumps(all_coverages, indent=2)}
+
 **BUILDING COVERAGES TO VALIDATE:**
 {json.dumps(buildings, indent=2)}
+
+**BPP COVERAGES TO VALIDATE:**
+{json.dumps(bpp_items, indent=2)}
 
 ==================================================
 POLICY DOCUMENT (DUAL OCR SOURCES)
@@ -173,11 +222,29 @@ Return ONLY a valid JSON object with this structure:
       "notes": "Explanation: How did you match this? Any modifications applied? Why MATCH/MISMATCH/NOT_FOUND?"
     }}
   ],
+  "bpp_validations": [
+    {{
+      "cert_bpp_name": "Name from certificate (e.g., 'Business Personal Property')",
+      "cert_bpp_value": "Value from certificate",
+      "status": "MATCH | MISMATCH | NOT_FOUND",
+      "policy_bpp_name": "How it appears in policy",
+      "policy_bpp_value": "Final effective limit in policy",
+      "policy_location": "Location/premises/building description from policy",
+      "policy_premises_building": "Premises/Building identifier if available (e.g., 'Premises 001 / Building 002')",
+      "evidence_declarations": "Quote from declarations page (OCR_SOURCE, Page X)",
+      "evidence_endorsements": "Quote from any modifying endorsement (OCR_SOURCE, Page X) or null",
+      "notes": "How you matched location/premises and why MATCH/MISMATCH/NOT_FOUND (avoid matching sublimits/extensions)."
+    }}
+  ],
   "summary": {{
     "total_buildings": 0,
     "matched": 0,
     "mismatched": 0,
-    "not_found": 0
+    "not_found": 0,
+    "total_bpp_items": 0,
+    "bpp_matched": 0,
+    "bpp_mismatched": 0,
+    "bpp_not_found": 0
   }},
   "qc_notes": "Overall observations about the validation"
 }}
@@ -216,17 +283,23 @@ Return ONLY the JSON object. No other text.
         with open(cert_json_path, 'r', encoding='utf-8') as f:
             cert_data = json.load(f)
         
-        # Extract building coverages
+        # Extract building + BPP coverages (single LLM call)
         buildings = self.extract_building_coverages(cert_data)
+        bpp_items = self.extract_bpp_coverages(cert_data)
         
-        if not buildings:
-            print("      ❌ No Building coverages found in certificate!")
+        if not buildings and not bpp_items:
+            print("      ❌ No Building or BPP coverages found in certificate!")
             print("      Certificate may be GL policy or missing coverage data.")
             return
         
-        print(f"      Found {len(buildings)} Building coverage(s):")
-        for b in buildings:
-            print(f"        - {b['name']}: {b['value']}")
+        if buildings:
+            print(f"      Found {len(buildings)} Building coverage(s):")
+            for b in buildings:
+                print(f"        - {b['name']}: {b['value']}")
+        if bpp_items:
+            print(f"      Found {len(bpp_items)} BPP coverage(s):")
+            for b in bpp_items:
+                print(f"        - {b['name']}: {b['value']}")
         
         # Load policy
         print(f"\n[2/5] Loading policy: {policy_combo_path}")
@@ -238,7 +311,7 @@ Return ONLY the JSON object. No other text.
         
         # Create prompt
         print(f"\n[3/5] Creating validation prompt...")
-        prompt = self.create_validation_prompt(cert_data, buildings, policy_text)
+        prompt = self.create_validation_prompt(cert_data, buildings, bpp_items, policy_text)
         prompt_size_kb = len(prompt) / 1024
         print(f"      Prompt size: {prompt_size_kb:.1f} KB")
         
@@ -297,7 +370,7 @@ Return ONLY the JSON object. No other text.
     def display_results(self, results: Dict):
         """Display validation results on console"""
         print(f"\n{'='*70}")
-        print("BUILDING VALIDATION RESULTS")
+        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP)")
         print(f"{'='*70}\n")
         
         validations = results.get('building_validations', [])
@@ -343,6 +416,54 @@ Return ONLY the JSON object. No other text.
                 notes = notes[:147] + "..."
             print(f"  Notes: {notes if notes else 'N/A'}")
             print()
+
+        # Display BPP validations (if present)
+        bpp_validations = results.get('bpp_validations', [])
+        if bpp_validations:
+            print(f"{'='*70}")
+            print("BPP VALIDATION RESULTS")
+            print(f"{'='*70}\n")
+
+            for v in bpp_validations:
+                status = v.get('status', 'UNKNOWN')
+                cert_name = v.get('cert_bpp_name', 'N/A')
+                cert_value = v.get('cert_bpp_value', 'N/A')
+                policy_name = v.get('policy_bpp_name', 'N/A')
+                policy_value = v.get('policy_bpp_value', 'N/A')
+                policy_location = v.get('policy_location', 'N/A')
+                policy_pb = v.get('policy_premises_building', 'N/A')
+                evidence_decl = v.get('evidence_declarations', 'N/A')
+                evidence_end = v.get('evidence_endorsements', None)
+                notes = v.get('notes', 'N/A')
+
+                if status == 'MATCH':
+                    icon = '✓'
+                elif status == 'MISMATCH':
+                    icon = '✗'
+                else:
+                    icon = '?'
+
+                print(f"{icon} {cert_name}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Value: {cert_value}")
+                print(f"  Policy Value: {policy_value}")
+                print(f"  Policy Label: {policy_name}")
+                print(f"  Policy Location: {policy_location}")
+                print(f"  Policy Prem/Building: {policy_pb}")
+
+                if evidence_decl and len(evidence_decl) > 100:
+                    evidence_decl = evidence_decl[:97] + "..."
+                print(f"  Evidence (Declarations): {evidence_decl if evidence_decl else 'N/A'}")
+
+                if evidence_end:
+                    if len(evidence_end) > 100:
+                        evidence_end = evidence_end[:97] + "..."
+                    print(f"  Evidence (Endorsements): {evidence_end}")
+
+                if notes and len(notes) > 150:
+                    notes = notes[:147] + "..."
+                print(f"  Notes: {notes if notes else 'N/A'}")
+                print()
         
         # Print summary
         summary = results.get('summary', {})
@@ -353,6 +474,12 @@ Return ONLY the JSON object. No other text.
         print(f"  ✓ Matched:      {summary.get('matched', 0)}")
         print(f"  ✗ Mismatched:   {summary.get('mismatched', 0)}")
         print(f"  ? Not Found:    {summary.get('not_found', 0)}")
+
+        if 'total_bpp_items' in summary:
+            print(f"\nTotal BPP Items:  {summary.get('total_bpp_items', 0)}")
+            print(f"  ✓ Matched:      {summary.get('bpp_matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('bpp_mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('bpp_not_found', 0)}")
         
         if 'qc_notes' in results:
             qc_notes = results['qc_notes']
@@ -366,8 +493,8 @@ Return ONLY the JSON object. No other text.
 def main():
     """Main execution function"""
     # ========== EDIT THESE VALUES ==========
-    cert_prefix = "drive"              # Change to: james, indian, etc.
-    carrier_dir = "travelerop"      # Change to: hartfordop, encovaop, etc.
+    cert_prefix = "james"              # Change to: james, indian, etc.
+    carrier_dir = "nationwideop"      # Change to: hartfordop, encovaop, etc.
     # =======================================
     
     # Construct paths
