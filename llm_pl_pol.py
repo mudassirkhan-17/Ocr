@@ -455,8 +455,8 @@ Now analyze the policy document and return the validation JSON:"""
 def main():
     """Main execution function"""
     # ========== EDIT THESE VALUES ==========
-    cert_prefix = "stay"              # Certificate name prefix (e.g., "stay", "indian", "evergreen")
-    carrier_dir = "nationwideop"      # Carrier directory
+    cert_prefix = "aaniya"              # Certificate name prefix (e.g., "stay", "indian", "evergreen")
+    carrier_dir = "encovaop"      # Carrier directory
     # =======================================
     
     # Construct paths

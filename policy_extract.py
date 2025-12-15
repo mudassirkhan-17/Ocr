@@ -1,7 +1,7 @@
 """
 Unified Policy OCR + Extraction Pipeline
 Takes a single input name, runs both Tesseract and PyMuPDF extractions,
-saves with consistent naming in nationwideop/ folder
+saves with consistent naming in carrier directory
 
 Usage:
     python policy_extract.py aaniya_policy
@@ -9,8 +9,8 @@ Usage:
     python policy_extract.py nationwide/aaniya_policy.pdf --max-pages 25
 
 Outputs:
-    - nationwideop/{base_name}_pol1.txt (Tesseract extraction)
-    - nationwideop/{base_name}_pol2.txt (PyMuPDF extraction)
+    - {carrier_dir}/{base_name}_pol1.txt (Tesseract extraction)
+    - {carrier_dir}/{base_name}_pol2.txt (PyMuPDF extraction)
     Note: "_policy" suffix is automatically stripped from base name
 """
 
@@ -65,20 +65,18 @@ def extract_base_name(input_path: str) -> str:
     return base_name
 
 
-def find_pdf_file(base_name: str) -> Optional[Path]:
+def find_pdf_file(base_name: str, pdf_dir: str = "nationwide") -> Optional[Path]:
     """
     Find PDF file by trying different locations and extensions
     
     Tries:
         1. {base_name}.pdf (current dir)
-        2. nationwide/{base_name}.pdf
-        3. nationwideop/{base_name}.pdf
+        2. {pdf_dir}/{base_name}.pdf
         4. {base_name} (as-is, if it's already a full path)
     """
     candidates = [
         Path(f"{base_name}.pdf"),
-        Path(f"nationwide/{base_name}.pdf"),
-        Path(f"nationwideop/{base_name}.pdf"),
+        Path(f"{pdf_dir}/{base_name}.pdf"),
         Path(base_name),  # In case it's already a full path
     ]
     
@@ -513,9 +511,15 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "evergreen_policy"
+        input_name = "webb_policy"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
+    
+    # Input/output directories
+    # - pdf_dir: where PDFs live (e.g., encova/, nationwide/, hartford/, traveler/)
+    # - output_dir: where extracted txt files are written (e.g., encovaop/, nationwideop/, ...)
+    pdf_dir = "encova"
+    carrier_dir = "encovaop"
     
     # Extract base name
     base_name = extract_base_name(input_name)
@@ -528,19 +532,18 @@ def main():
     print(f"Base name: {base_name}\n")
     
     # Find PDF file
-    pdf_path = find_pdf_file(base_name)
+    pdf_path = find_pdf_file(base_name, pdf_dir=pdf_dir)
     if not pdf_path:
         print(f"❌ PDF file not found for: {base_name}")
         print("   Tried:")
         print(f"     - {base_name}.pdf")
-        print(f"     - nationwide/{base_name}.pdf")
-        print(f"     - nationwideop/{base_name}.pdf")
+        print(f"     - {pdf_dir}/{base_name}.pdf")
         return
     
     print(f"✅ Found PDF: {pdf_path}\n")
     
     # Set up output paths
-    output_dir = Path("nationwideop")
+    output_dir = Path(carrier_dir)
     output_dir.mkdir(exist_ok=True)
     
     tesseract_output = output_dir / f"{output_base}_pol1.txt"

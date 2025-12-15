@@ -114,8 +114,8 @@ def combine_extraction_files(
     
     # Handle output file path
     if output_file is None:
-        # Generate default output filename
-        output_path = Path("nationwideop/combined.txt")
+        # Generate default output filename (will use carrier_dir from main)
+        output_path = Path("encovaop/combined.txt")
     else:
         # Use provided output file path (already a full path from main())
         output_path = Path(output_file)
@@ -263,16 +263,19 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "stay"
+        input_name = "webb"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
+    
+    # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
+    carrier_dir = "encovaop"
     
     # Extract base name
     base_name = extract_base_name(input_name)
     print(f"Base name: {base_name}\n")
     
     # Set up input/output paths
-    output_dir = Path("nationwideop")
+    output_dir = Path(carrier_dir)
     output_dir.mkdir(exist_ok=True)
     
     tesseract_file = output_dir / f"{base_name}_fil1.txt"

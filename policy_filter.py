@@ -8,8 +8,8 @@ Usage:
     python policy_filter.py aaniya_policy
 
 Outputs:
-    - nationwideop/{base_name}_fil1.txt (filtered Tesseract extraction)
-    - nationwideop/{base_name}_fil2.txt (filtered PyMuPDF extraction)
+    - {carrier_dir}/{base_name}_fil1.txt (filtered Tesseract extraction)
+    - {carrier_dir}/{base_name}_fil2.txt (filtered PyMuPDF extraction)
 """
 
 import re
@@ -242,16 +242,19 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "stay"
+        input_name = "webb"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
+    
+    # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
+    carrier_dir = "encovaop"
     
     # Extract base name
     base_name = extract_base_name(input_name)
     print(f"Base name: {base_name}\n")
     
     # Set up input/output paths
-    output_dir = Path("nationwideop")
+    output_dir = Path(carrier_dir)
     output_dir.mkdir(exist_ok=True)
     
     tesseract_input = output_dir / f"{base_name}_pol1.txt"

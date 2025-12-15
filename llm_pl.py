@@ -473,18 +473,21 @@ def main():
     # Get input file
     if len(sys.argv) < 2:
         print("⚠️  No input provided, using default: james_pl")
-        base_name = "stay_pl"
+        base_name = "drive_pl"
     else:
         base_name = sys.argv[1]
     
+    # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
+    carrier_dir = "travelerop"
+    
     # Look for the combo file (best extraction)
-    input_file = Path(f"nationwideop/{base_name}_combo.txt")
+    input_file = Path(f"{carrier_dir}/{base_name}_combo.txt")
     
     if not input_file.exists():
         # Try alternatives
         alternatives = [
-            Path(f"nationwideop/{base_name}2.txt"),  # PyMuPDF
-            Path(f"nationwideop/{base_name}1.txt"),  # Tesseract
+            Path(f"{carrier_dir}/{base_name}2.txt"),  # PyMuPDF
+            Path(f"{carrier_dir}/{base_name}1.txt"),  # Tesseract
         ]
         for alt in alternatives:
             if alt.exists():
@@ -529,7 +532,7 @@ def main():
     print()
     
     # Save results
-    output_file = Path(f"nationwideop/{base_name}_extracted_real.json")
+    output_file = Path(f"{carrier_dir}/{base_name}_extracted_real.json")
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2)
     
