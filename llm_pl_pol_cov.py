@@ -15,7 +15,7 @@ load_dotenv()
 
 
 class BuildingCoverageValidator:
-    """Validate Building + BPP + Money & Securities + Equipment Breakdown coverages from certificate against policy (single LLM call)"""
+    """Validate Building + BPP + Money & Securities + Equipment Breakdown + Outdoor Signs coverages from certificate against policy (single LLM call)"""
     
     def __init__(self, model: str = "gpt-4o-mini"):
         """
@@ -174,8 +174,49 @@ class BuildingCoverageValidator:
                 eb_items.append({"name": name, "value": coverage_value})
 
         return eb_items
+
+    def extract_outdoor_signs_coverages(self, cert_data: Dict) -> List[Dict]:
+        """
+        Extract Outdoor Signs coverages from certificate.
+
+        Notes:
+        - Can be "Included" / "Yes" or a dollar limit
+        - Wording varies: "Outdoor Signs", "Signs", "Outdoor sign(s)"
+        - Avoid confusing with "signs you must display" type policy language by requiring "sign" to appear as a coverage name from cert.
+        """
+        coverages = cert_data.get("coverages", {}) or {}
+        os_items: List[Dict] = []
+
+        for coverage_name, coverage_value in coverages.items():
+            name = (coverage_name or "").strip()
+            n = name.lower()
+
+            is_outdoor_signs = (
+                "outdoor sign" in n
+                or "outdoor signs" in n
+                or (n == "signs")
+                or (n.startswith("signs ") or n.endswith(" signs"))
+            )
+
+            # Exclude non-coverage details if they appear as keys
+            is_excluded = any(
+                kw in n
+                for kw in [
+                    "deductible",
+                    "ded.",
+                    "coinsurance",
+                    "waiting period",
+                    "waiting",
+                    "description",
+                ]
+            )
+
+            if is_outdoor_signs and not is_excluded:
+                os_items.append({"name": name, "value": coverage_value})
+
+        return os_items
     
-    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], policy_text: str) -> str:
+    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], os_items: List[Dict], policy_text: str) -> str:
         """
         Create validation prompt for Building coverages
         
@@ -223,6 +264,9 @@ Validate BUILDING, Business Personal Property (BPP), Money & Securities, and Equ
 
 **EQUIPMENT BREAKDOWN COVERAGES TO VALIDATE:**
 {json.dumps(eb_items, indent=2)}
+
+**OUTDOOR SIGNS COVERAGES TO VALIDATE:**
+{json.dumps(os_items, indent=2)}
 
 ==================================================
 POLICY DOCUMENT (DUAL OCR SOURCES)
@@ -317,6 +361,20 @@ For EACH Equipment Breakdown item:
 - Evidence must include page number and OCR source.
 
 ==================================================
+OUTDOOR SIGNS VALIDATION RULES (STRICT)
+==================================================
+
+For EACH Outdoor Signs item:
+- Certificate value may be "Included" / "Yes" or a dollar limit (e.g., 10,000 / 25,000 / 50,000).
+- MATCH rules:
+  - If certificate is "Included"/"Yes": MATCH if policy indicates Outdoor Signs are covered/included OR shows a limit for Outdoor Signs (it can still be "included" but expressed as a limit).
+  - If certificate is a dollar limit: MATCH only if the policy’s Outdoor Signs limit matches (ignore $/commas/spacing).
+- Do NOT confuse Outdoor Signs with:
+  - Premises/operations signage text, posting requirements, general "sign" mentions
+  - Other property coverages that mention signs as part of wording
+- Evidence must cite declarations/coverage schedule or the specific coverage form/endorsement and include OCR source + page.
+
+==================================================
 OUTPUT FORMAT
 ==================================================
 
@@ -377,6 +435,19 @@ Return ONLY a valid JSON object with this structure:
       "notes": "Explain how you matched and why MATCH/MISMATCH/NOT_FOUND."
     }}
   ],
+  "outdoor_signs_validations": [
+    {{
+      "cert_os_name": "Name from certificate (e.g., 'Outdoor Signs')",
+      "cert_os_value": "Value from certificate (e.g., 'Included' or '25,000')",
+      "status": "MATCH | MISMATCH | NOT_FOUND",
+      "policy_os_name": "How it appears in policy",
+      "policy_os_value": "Policy value (Included/Yes or a dollar limit) or null",
+      "policy_location": "Location/premises/building description from policy (or null if policy-wide)",
+      "evidence_declarations": "Quote from declarations/coverage schedule (OCR_SOURCE, Page X)",
+      "evidence_endorsements": "Quote from any modifying endorsement (OCR_SOURCE, Page X) or null",
+      "notes": "Explain how you matched and why MATCH/MISMATCH/NOT_FOUND."
+    }}
+  ],
   "summary": {{
     "total_buildings": 0,
     "matched": 0,
@@ -393,7 +464,11 @@ Return ONLY a valid JSON object with this structure:
     "total_eb_items": 0,
     "eb_matched": 0,
     "eb_mismatched": 0,
-    "eb_not_found": 0
+    "eb_not_found": 0,
+    "total_os_items": 0,
+    "os_matched": 0,
+    "os_mismatched": 0,
+    "os_not_found": 0
   }},
   "qc_notes": "Overall observations about the validation"
 }}
@@ -432,14 +507,15 @@ Return ONLY the JSON object. No other text.
         with open(cert_json_path, 'r', encoding='utf-8') as f:
             cert_data = json.load(f)
         
-        # Extract building + BPP + Money & Securities + Equipment Breakdown coverages (single LLM call)
+        # Extract building + BPP + Money & Securities + Equipment Breakdown + Outdoor Signs coverages (single LLM call)
         buildings = self.extract_building_coverages(cert_data)
         bpp_items = self.extract_bpp_coverages(cert_data)
         ms_items = self.extract_money_securities_coverages(cert_data)
         eb_items = self.extract_equipment_breakdown_coverages(cert_data)
+        os_items = self.extract_outdoor_signs_coverages(cert_data)
         
-        if not buildings and not bpp_items and not ms_items and not eb_items:
-            print("      ❌ No Building, BPP, Money & Securities, or Equipment Breakdown coverages found in certificate!")
+        if not buildings and not bpp_items and not ms_items and not eb_items and not os_items:
+            print("      ❌ No Building, BPP, Money & Securities, Equipment Breakdown, or Outdoor Signs coverages found in certificate!")
             print("      Certificate may be GL policy or missing coverage data.")
             return
         
@@ -459,6 +535,10 @@ Return ONLY the JSON object. No other text.
             print(f"      Found {len(eb_items)} Equipment Breakdown coverage(s):")
             for e in eb_items:
                 print(f"        - {e['name']}: {e['value']}")
+        if os_items:
+            print(f"      Found {len(os_items)} Outdoor Signs coverage(s):")
+            for o in os_items:
+                print(f"        - {o['name']}: {o['value']}")
         
         # Load policy
         print(f"\n[2/5] Loading policy: {policy_combo_path}")
@@ -470,7 +550,7 @@ Return ONLY the JSON object. No other text.
         
         # Create prompt
         print(f"\n[3/5] Creating validation prompt...")
-        prompt = self.create_validation_prompt(cert_data, buildings, bpp_items, ms_items, eb_items, policy_text)
+        prompt = self.create_validation_prompt(cert_data, buildings, bpp_items, ms_items, eb_items, os_items, policy_text)
         prompt_size_kb = len(prompt) / 1024
         print(f"      Prompt size: {prompt_size_kb:.1f} KB")
         
@@ -529,7 +609,7 @@ Return ONLY the JSON object. No other text.
     def display_results(self, results: Dict):
         """Display validation results on console"""
         print(f"\n{'='*70}")
-        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + MONEY & SECURITIES + EQUIPMENT BREAKDOWN)")
+        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + MONEY & SECURITIES + EQUIPMENT BREAKDOWN + OUTDOOR SIGNS)")
         print(f"{'='*70}\n")
         
         validations = results.get('building_validations', [])
@@ -718,6 +798,52 @@ Return ONLY the JSON object. No other text.
                     notes = notes[:147] + "..."
                 print(f"  Notes: {notes if notes else 'N/A'}")
                 print()
+
+        # Display Outdoor Signs validations (if present)
+        os_validations = results.get('outdoor_signs_validations', [])
+        if os_validations:
+            print(f"{'='*70}")
+            print("OUTDOOR SIGNS VALIDATION RESULTS")
+            print(f"{'='*70}\n")
+
+            for v in os_validations:
+                status = v.get('status', 'UNKNOWN')
+                cert_name = v.get('cert_os_name', 'N/A')
+                cert_value = v.get('cert_os_value', 'N/A')
+                policy_name = v.get('policy_os_name', 'N/A')
+                policy_value = v.get('policy_os_value', 'N/A')
+                policy_location = v.get('policy_location', 'N/A')
+                evidence_decl = v.get('evidence_declarations', 'N/A')
+                evidence_end = v.get('evidence_endorsements', None)
+                notes = v.get('notes', 'N/A')
+
+                if status == 'MATCH':
+                    icon = '✓'
+                elif status == 'MISMATCH':
+                    icon = '✗'
+                else:
+                    icon = '?'
+
+                print(f"{icon} {cert_name}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Value: {cert_value}")
+                print(f"  Policy Value: {policy_value}")
+                print(f"  Policy Label: {policy_name}")
+                print(f"  Policy Location: {policy_location}")
+
+                if evidence_decl and len(evidence_decl) > 100:
+                    evidence_decl = evidence_decl[:97] + "..."
+                print(f"  Evidence (Declarations): {evidence_decl if evidence_decl else 'N/A'}")
+
+                if evidence_end:
+                    if len(evidence_end) > 100:
+                        evidence_end = evidence_end[:97] + "..."
+                    print(f"  Evidence (Endorsements): {evidence_end}")
+
+                if notes and len(notes) > 150:
+                    notes = notes[:147] + "..."
+                print(f"  Notes: {notes if notes else 'N/A'}")
+                print()
         
         # Print summary
         summary = results.get('summary', {})
@@ -746,6 +872,12 @@ Return ONLY the JSON object. No other text.
             print(f"  ✓ Matched:      {summary.get('eb_matched', 0)}")
             print(f"  ✗ Mismatched:   {summary.get('eb_mismatched', 0)}")
             print(f"  ? Not Found:    {summary.get('eb_not_found', 0)}")
+
+        if 'total_os_items' in summary:
+            print(f"\nTotal Outdoor Signs Items:  {summary.get('total_os_items', 0)}")
+            print(f"  ✓ Matched:      {summary.get('os_matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('os_mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('os_not_found', 0)}")
         
         if 'qc_notes' in results:
             qc_notes = results['qc_notes']
@@ -759,8 +891,8 @@ Return ONLY the JSON object. No other text.
 def main():
     """Main execution function"""
     # ========== EDIT THESE VALUES ==========
-    cert_prefix = "salem"              # Change to: james, indian, etc.
-    carrier_dir = "encovaop"      # Change to: hartfordop, encovaop, etc.
+    cert_prefix = "indian"              # Change to: james, indian, etc.
+    carrier_dir = "nationwideop"      # Change to: hartfordop, encovaop, etc.
     # =======================================
     
     # Construct paths
