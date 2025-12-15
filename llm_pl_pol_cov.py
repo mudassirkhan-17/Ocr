@@ -15,7 +15,7 @@ load_dotenv()
 
 
 class BuildingCoverageValidator:
-    """Validate Building + BPP + Money & Securities coverages from certificate against policy (single LLM call)"""
+    """Validate Building + BPP + Money & Securities + Equipment Breakdown coverages from certificate against policy (single LLM call)"""
     
     def __init__(self, model: str = "gpt-4o-mini"):
         """
@@ -133,8 +133,49 @@ class BuildingCoverageValidator:
                 ms_items.append({"name": name, "value": coverage_value})
 
         return ms_items
+
+    def extract_equipment_breakdown_coverages(self, cert_data: Dict) -> List[Dict]:
+        """
+        Extract Equipment Breakdown coverages from certificate.
+
+        Notes:
+        - Often "Included" / "Yes"
+        - Sometimes a dollar limit
+        - Avoid picking up deductibles or other non-limit fields
+        """
+        coverages = cert_data.get("coverages", {}) or {}
+        eb_items: List[Dict] = []
+
+        for coverage_name, coverage_value in coverages.items():
+            name = (coverage_name or "").strip()
+            n = name.lower()
+
+            is_eb = (
+                "equipment breakdown" in n
+                or ("equip" in n and "breakdown" in n)
+                or "boiler and machinery" in n
+                or "boiler & machinery" in n
+            )
+
+            # Exclude non-limit fields that sometimes appear near EB
+            is_excluded = any(
+                kw in n
+                for kw in [
+                    "deductible",
+                    "ded.",
+                    "coinsurance",
+                    "waiting period",
+                    "waiting",
+                    "service interruption",
+                ]
+            )
+
+            if is_eb and not is_excluded:
+                eb_items.append({"name": name, "value": coverage_value})
+
+        return eb_items
     
-    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], policy_text: str) -> str:
+    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], policy_text: str) -> str:
         """
         Create validation prompt for Building coverages
         
@@ -161,7 +202,7 @@ CRITICAL INSTRUCTIONS
 ==================================================
 
 **YOUR TASK:**
-Validate BUILDING, Business Personal Property (BPP), and Money & Securities coverage limits from the certificate against the policy document.
+Validate BUILDING, Business Personal Property (BPP), Money & Securities, and Equipment Breakdown coverages from the certificate against the policy document.
 
 **CONTEXT FROM CERTIFICATE:**
 - Insured Name: {insured_name}
@@ -179,6 +220,9 @@ Validate BUILDING, Business Personal Property (BPP), and Money & Securities cove
 
 **MONEY & SECURITIES COVERAGES TO VALIDATE:**
 {json.dumps(ms_items, indent=2)}
+
+**EQUIPMENT BREAKDOWN COVERAGES TO VALIDATE:**
+{json.dumps(eb_items, indent=2)}
 
 ==================================================
 POLICY DOCUMENT (DUAL OCR SOURCES)
@@ -258,6 +302,21 @@ For EACH Money & Securities item:
 - If certificate says "Included", treat as MATCH only if policy indicates it is covered/included (or shows a limit as part of the form).
 
 ==================================================
+EQUIPMENT BREAKDOWN VALIDATION RULES (STRICT)
+==================================================
+
+For EACH Equipment Breakdown item:
+- The certificate value may be "Included" / "Yes" / "Provided" instead of a dollar amount.
+- MATCH rules:
+  - If certificate is "Included"/"Yes": MATCH if policy indicates Equipment Breakdown is included/covered OR provides a limit as part of the Equipment Breakdown coverage.
+  - If certificate is a dollar limit: MATCH only if the policy's Equipment Breakdown limit matches (ignore formatting like $ and commas).
+- Do NOT confuse Equipment Breakdown coverage with:
+  - Equipment Breakdown deductible
+  - Service Interruption sublimit
+  - Other mechanical breakdown wording that is not a coverage grant/limit
+- Evidence must include page number and OCR source.
+
+==================================================
 OUTPUT FORMAT
 ==================================================
 
@@ -305,6 +364,19 @@ Return ONLY a valid JSON object with this structure:
       "notes": "Explain how you matched and why MATCH/MISMATCH/NOT_FOUND."
     }}
   ],
+  "equipment_breakdown_validations": [
+    {{
+      "cert_eb_name": "Name from certificate (e.g., 'Equipment Breakdown')",
+      "cert_eb_value": "Value from certificate (e.g., 'Included' or '100,000')",
+      "status": "MATCH | MISMATCH | NOT_FOUND",
+      "policy_eb_name": "How it appears in policy",
+      "policy_eb_value": "Policy value (Included/Yes or a dollar limit) or null",
+      "policy_location": "Location/premises/building description from policy (or null if policy-wide)",
+      "evidence_declarations": "Quote from declarations/coverage schedule (OCR_SOURCE, Page X)",
+      "evidence_endorsements": "Quote from any modifying endorsement (OCR_SOURCE, Page X) or null",
+      "notes": "Explain how you matched and why MATCH/MISMATCH/NOT_FOUND."
+    }}
+  ],
   "summary": {{
     "total_buildings": 0,
     "matched": 0,
@@ -317,7 +389,11 @@ Return ONLY a valid JSON object with this structure:
     "total_ms_items": 0,
     "ms_matched": 0,
     "ms_mismatched": 0,
-    "ms_not_found": 0
+    "ms_not_found": 0,
+    "total_eb_items": 0,
+    "eb_matched": 0,
+    "eb_mismatched": 0,
+    "eb_not_found": 0
   }},
   "qc_notes": "Overall observations about the validation"
 }}
@@ -356,13 +432,14 @@ Return ONLY the JSON object. No other text.
         with open(cert_json_path, 'r', encoding='utf-8') as f:
             cert_data = json.load(f)
         
-        # Extract building + BPP + Money & Securities coverages (single LLM call)
+        # Extract building + BPP + Money & Securities + Equipment Breakdown coverages (single LLM call)
         buildings = self.extract_building_coverages(cert_data)
         bpp_items = self.extract_bpp_coverages(cert_data)
         ms_items = self.extract_money_securities_coverages(cert_data)
+        eb_items = self.extract_equipment_breakdown_coverages(cert_data)
         
-        if not buildings and not bpp_items and not ms_items:
-            print("      ❌ No Building, BPP, or Money & Securities coverages found in certificate!")
+        if not buildings and not bpp_items and not ms_items and not eb_items:
+            print("      ❌ No Building, BPP, Money & Securities, or Equipment Breakdown coverages found in certificate!")
             print("      Certificate may be GL policy or missing coverage data.")
             return
         
@@ -378,6 +455,10 @@ Return ONLY the JSON object. No other text.
             print(f"      Found {len(ms_items)} Money & Securities coverage(s):")
             for m in ms_items:
                 print(f"        - {m['name']}: {m['value']}")
+        if eb_items:
+            print(f"      Found {len(eb_items)} Equipment Breakdown coverage(s):")
+            for e in eb_items:
+                print(f"        - {e['name']}: {e['value']}")
         
         # Load policy
         print(f"\n[2/5] Loading policy: {policy_combo_path}")
@@ -389,7 +470,7 @@ Return ONLY the JSON object. No other text.
         
         # Create prompt
         print(f"\n[3/5] Creating validation prompt...")
-        prompt = self.create_validation_prompt(cert_data, buildings, bpp_items, ms_items, policy_text)
+        prompt = self.create_validation_prompt(cert_data, buildings, bpp_items, ms_items, eb_items, policy_text)
         prompt_size_kb = len(prompt) / 1024
         print(f"      Prompt size: {prompt_size_kb:.1f} KB")
         
@@ -448,7 +529,7 @@ Return ONLY the JSON object. No other text.
     def display_results(self, results: Dict):
         """Display validation results on console"""
         print(f"\n{'='*70}")
-        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP)")
+        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + MONEY & SECURITIES + EQUIPMENT BREAKDOWN)")
         print(f"{'='*70}\n")
         
         validations = results.get('building_validations', [])
@@ -591,6 +672,52 @@ Return ONLY the JSON object. No other text.
                     notes = notes[:147] + "..."
                 print(f"  Notes: {notes if notes else 'N/A'}")
                 print()
+
+        # Display Equipment Breakdown validations (if present)
+        eb_validations = results.get('equipment_breakdown_validations', [])
+        if eb_validations:
+            print(f"{'='*70}")
+            print("EQUIPMENT BREAKDOWN VALIDATION RESULTS")
+            print(f"{'='*70}\n")
+
+            for v in eb_validations:
+                status = v.get('status', 'UNKNOWN')
+                cert_name = v.get('cert_eb_name', 'N/A')
+                cert_value = v.get('cert_eb_value', 'N/A')
+                policy_name = v.get('policy_eb_name', 'N/A')
+                policy_value = v.get('policy_eb_value', 'N/A')
+                policy_location = v.get('policy_location', 'N/A')
+                evidence_decl = v.get('evidence_declarations', 'N/A')
+                evidence_end = v.get('evidence_endorsements', None)
+                notes = v.get('notes', 'N/A')
+
+                if status == 'MATCH':
+                    icon = '✓'
+                elif status == 'MISMATCH':
+                    icon = '✗'
+                else:
+                    icon = '?'
+
+                print(f"{icon} {cert_name}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Value: {cert_value}")
+                print(f"  Policy Value: {policy_value}")
+                print(f"  Policy Label: {policy_name}")
+                print(f"  Policy Location: {policy_location}")
+
+                if evidence_decl and len(evidence_decl) > 100:
+                    evidence_decl = evidence_decl[:97] + "..."
+                print(f"  Evidence (Declarations): {evidence_decl if evidence_decl else 'N/A'}")
+
+                if evidence_end:
+                    if len(evidence_end) > 100:
+                        evidence_end = evidence_end[:97] + "..."
+                    print(f"  Evidence (Endorsements): {evidence_end}")
+
+                if notes and len(notes) > 150:
+                    notes = notes[:147] + "..."
+                print(f"  Notes: {notes if notes else 'N/A'}")
+                print()
         
         # Print summary
         summary = results.get('summary', {})
@@ -613,6 +740,12 @@ Return ONLY the JSON object. No other text.
             print(f"  ✓ Matched:      {summary.get('ms_matched', 0)}")
             print(f"  ✗ Mismatched:   {summary.get('ms_mismatched', 0)}")
             print(f"  ? Not Found:    {summary.get('ms_not_found', 0)}")
+
+        if 'total_eb_items' in summary:
+            print(f"\nTotal Equipment Breakdown Items:  {summary.get('total_eb_items', 0)}")
+            print(f"  ✓ Matched:      {summary.get('eb_matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('eb_mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('eb_not_found', 0)}")
         
         if 'qc_notes' in results:
             qc_notes = results['qc_notes']
@@ -626,8 +759,8 @@ Return ONLY the JSON object. No other text.
 def main():
     """Main execution function"""
     # ========== EDIT THESE VALUES ==========
-    cert_prefix = "jay"              # Change to: james, indian, etc.
-    carrier_dir = "travelerop"      # Change to: hartfordop, encovaop, etc.
+    cert_prefix = "salem"              # Change to: james, indian, etc.
+    carrier_dir = "encovaop"      # Change to: hartfordop, encovaop, etc.
     # =======================================
     
     # Construct paths
