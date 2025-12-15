@@ -15,7 +15,7 @@ load_dotenv()
 
 
 class BuildingCoverageValidator:
-    """Validate Building + BPP + Money & Securities + Equipment Breakdown + Outdoor Signs + Employee Dishonesty coverages from certificate against policy (single LLM call)"""
+    """Validate Building + BPP + Money & Securities + Equipment Breakdown + Outdoor Signs + Employee Dishonesty + Pumps/Canopy coverages from certificate against policy (single LLM call)"""
     
     def __init__(self, model: str = "gpt-4o-mini"):
         """
@@ -46,7 +46,12 @@ class BuildingCoverageValidator:
         
         for coverage_name, coverage_value in coverages.items():
             # Match any coverage with "Building" in the name
-            if "building" in coverage_name.lower():
+            n = (coverage_name or "").lower()
+            # Avoid double-counting special combined labels (handled in Pumps/Canopy validation)
+            is_building_with_pumps_canopy = (
+                "building" in n and "pump" in n and "canopy" in n
+            )
+            if "building" in n and not is_building_with_pumps_canopy:
                 buildings.append({
                     "name": coverage_name,
                     "value": coverage_value
@@ -255,8 +260,67 @@ class BuildingCoverageValidator:
                 ed_items.append({"name": name, "value": coverage_value})
 
         return ed_items
+
+    def extract_pumps_canopy_coverages(self, cert_data: Dict) -> List[Dict]:
+        """
+        Extract Pumps / Canopy related coverages from certificate, supporting:
+        - Separate: "Pumps", "Canopy"
+        - Combined: "Pumps & Canopy" (or "Pumps and Canopy")
+        - Combined with Building: "Building with Pumps & Canopy"
+        """
+        coverages = cert_data.get("coverages", {}) or {}
+
+        # Track presence to apply precedence rules (prefer combined label if present)
+        combined_building_key = None
+        combined_pc_key = None
+        pumps_key = None
+        canopy_key = None
+
+        for coverage_name in coverages.keys():
+            name = (coverage_name or "").strip()
+            n = name.lower()
+
+            if "building" in n and "pump" in n and "canopy" in n:
+                combined_building_key = coverage_name
+                continue
+
+            # Combined pumps+canopy label
+            if ("pump" in n and "canopy" in n) and ("building" not in n):
+                # e.g. "Pumps & Canopy"
+                combined_pc_key = coverage_name
+                continue
+
+            # Separate
+            if n in ("pumps", "pump") or n.startswith("pumps ") or n.endswith(" pumps"):
+                pumps_key = coverage_name
+                continue
+
+            if n in ("canopy", "canopies") or n.startswith("canopy ") or n.endswith(" canopy") or n.endswith(" canopies"):
+                canopy_key = coverage_name
+                continue
+
+        # Precedence:
+        # 1) If "Building with Pumps & Canopy" exists, validate only that combined item (avoid double-counting components)
+        # 2) Else if "Pumps & Canopy" exists, validate that combined item (components may still exist, but we avoid duplicates)
+        # 3) Else validate separate Pumps/Canopy if present
+        items: List[Dict] = []
+
+        if combined_building_key:
+            items.append({"name": combined_building_key, "value": coverages.get(combined_building_key)})
+            return items
+
+        if combined_pc_key:
+            items.append({"name": combined_pc_key, "value": coverages.get(combined_pc_key)})
+            return items
+
+        if pumps_key:
+            items.append({"name": pumps_key, "value": coverages.get(pumps_key)})
+        if canopy_key:
+            items.append({"name": canopy_key, "value": coverages.get(canopy_key)})
+
+        return items
     
-    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], os_items: List[Dict], ed_items: List[Dict], policy_text: str) -> str:
+    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], os_items: List[Dict], ed_items: List[Dict], pc_items: List[Dict], policy_text: str) -> str:
         """
         Create validation prompt for Building coverages
         
@@ -283,7 +347,7 @@ CRITICAL INSTRUCTIONS
 ==================================================
 
 **YOUR TASK:**
-Validate BUILDING, Business Personal Property (BPP), Money & Securities, Equipment Breakdown, Outdoor Signs, and Employee Dishonesty coverages from the certificate against the policy document.
+Validate BUILDING, Business Personal Property (BPP), Money & Securities, Equipment Breakdown, Outdoor Signs, Employee Dishonesty, and Pumps/Canopy coverages from the certificate against the policy document.
 
 **CONTEXT FROM CERTIFICATE:**
 - Insured Name: {insured_name}
@@ -310,6 +374,9 @@ Validate BUILDING, Business Personal Property (BPP), Money & Securities, Equipme
 
 **EMPLOYEE DISHONESTY COVERAGES TO VALIDATE:**
 {json.dumps(ed_items, indent=2)}
+
+**PUMPS / CANOPY COVERAGES TO VALIDATE:**
+{json.dumps(pc_items, indent=2)}
 
 ==================================================
 POLICY DOCUMENT (DUAL OCR SOURCES)
@@ -435,6 +502,28 @@ For EACH Employee Dishonesty item:
 - Evidence must include OCR source + page number.
 
 ==================================================
+PUMPS / CANOPY VALIDATION RULES (STRICT)
+==================================================
+
+This coverage family can appear in multiple equivalent representations across certificates/policies:
+- Separate: "Pumps" and "Canopy"
+- Combined: "Pumps & Canopy"
+- Combined with Building: "Building with Pumps & Canopy"
+
+For EACH Pumps/Canopy item:
+- If certificate item is "Pumps & Canopy":
+  - MATCH if policy shows "Pumps & Canopy" with same limit OR policy shows separate "Pumps" and "Canopy" whose SUM equals the certificate limit.
+- If certificate item is "Building with Pumps & Canopy":
+  - MATCH if policy shows the same combined label with same limit OR policy shows:
+    - Building + Pumps + Canopy (sum), OR
+    - Building + (Pumps & Canopy) (sum)
+- If certificate items are separate ("Pumps" and/or "Canopy"):
+  - MATCH if policy shows that same separate item with same limit.
+  - If policy only shows a combined "Pumps & Canopy" limit, you may MATCH the separate items if the combined limit equals the SUM of the separate certificate limits; note clearly that the policy is combined.
+- Do NOT confuse pumps/canopy with other property items.
+- Evidence must include OCR source + page number for each component used in a sum match.
+
+==================================================
 OUTPUT FORMAT
 ==================================================
 
@@ -521,6 +610,20 @@ Return ONLY a valid JSON object with this structure:
       "notes": "Explain how you matched and why MATCH/MISMATCH/NOT_FOUND."
     }}
   ],
+  "pumps_canopy_validations": [
+    {{
+      "cert_pc_name": "Name from certificate (e.g., 'Pumps', 'Canopy', 'Pumps & Canopy', 'Building with Pumps & Canopy')",
+      "cert_pc_value": "Value from certificate",
+      "status": "MATCH | MISMATCH | NOT_FOUND",
+      "policy_pc_name": "How it appears in policy",
+      "policy_pc_value": "Policy value (single limit) or null",
+      "policy_pc_components": "If matched by sum, list components and values like 'Building $X; Pumps $Y; Canopy $Z' or null",
+      "policy_location": "Location/premises/building description from policy (or null if policy-wide)",
+      "evidence_declarations": "Quote(s) from declarations/schedules (OCR_SOURCE, Page X) - include all components if sum",
+      "evidence_endorsements": "Quote from endorsements if applicable (OCR_SOURCE, Page X) or null",
+      "notes": "Explain match method (direct vs sum) and why MATCH/MISMATCH/NOT_FOUND."
+    }}
+  ],
   "summary": {{
     "total_buildings": 0,
     "matched": 0,
@@ -545,7 +648,11 @@ Return ONLY a valid JSON object with this structure:
     "total_ed_items": 0,
     "ed_matched": 0,
     "ed_mismatched": 0,
-    "ed_not_found": 0
+    "ed_not_found": 0,
+    "total_pc_items": 0,
+    "pc_matched": 0,
+    "pc_mismatched": 0,
+    "pc_not_found": 0
   }},
   "qc_notes": "Overall observations about the validation"
 }}
@@ -584,16 +691,17 @@ Return ONLY the JSON object. No other text.
         with open(cert_json_path, 'r', encoding='utf-8') as f:
             cert_data = json.load(f)
         
-        # Extract building + BPP + Money & Securities + Equipment Breakdown + Outdoor Signs + Employee Dishonesty coverages (single LLM call)
+        # Extract building + BPP + Money & Securities + Equipment Breakdown + Outdoor Signs + Employee Dishonesty + Pumps/Canopy coverages (single LLM call)
         buildings = self.extract_building_coverages(cert_data)
         bpp_items = self.extract_bpp_coverages(cert_data)
         ms_items = self.extract_money_securities_coverages(cert_data)
         eb_items = self.extract_equipment_breakdown_coverages(cert_data)
         os_items = self.extract_outdoor_signs_coverages(cert_data)
         ed_items = self.extract_employee_dishonesty_coverages(cert_data)
+        pc_items = self.extract_pumps_canopy_coverages(cert_data)
         
-        if not buildings and not bpp_items and not ms_items and not eb_items and not os_items and not ed_items:
-            print("      ❌ No Building, BPP, Money & Securities, Equipment Breakdown, Outdoor Signs, or Employee Dishonesty coverages found in certificate!")
+        if not buildings and not bpp_items and not ms_items and not eb_items and not os_items and not ed_items and not pc_items:
+            print("      ❌ No supported coverages found in certificate (Building/BPP/Money&Sec/EquipBreak/OutdoorSigns/EmployeeDishonesty/PumpsCanopy)!")
             print("      Certificate may be GL policy or missing coverage data.")
             return
         
@@ -621,6 +729,10 @@ Return ONLY the JSON object. No other text.
             print(f"      Found {len(ed_items)} Employee Dishonesty coverage(s):")
             for e in ed_items:
                 print(f"        - {e['name']}: {e['value']}")
+        if pc_items:
+            print(f"      Found {len(pc_items)} Pumps/Canopy coverage(s):")
+            for p in pc_items:
+                print(f"        - {p['name']}: {p['value']}")
         
         # Load policy
         print(f"\n[2/5] Loading policy: {policy_combo_path}")
@@ -632,7 +744,7 @@ Return ONLY the JSON object. No other text.
         
         # Create prompt
         print(f"\n[3/5] Creating validation prompt...")
-        prompt = self.create_validation_prompt(cert_data, buildings, bpp_items, ms_items, eb_items, os_items, ed_items, policy_text)
+        prompt = self.create_validation_prompt(cert_data, buildings, bpp_items, ms_items, eb_items, os_items, ed_items, pc_items, policy_text)
         prompt_size_kb = len(prompt) / 1024
         print(f"      Prompt size: {prompt_size_kb:.1f} KB")
         
@@ -691,7 +803,7 @@ Return ONLY the JSON object. No other text.
     def display_results(self, results: Dict):
         """Display validation results on console"""
         print(f"\n{'='*70}")
-        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + MONEY & SECURITIES + EQUIPMENT BREAKDOWN + OUTDOOR SIGNS + EMPLOYEE DISHONESTY)")
+        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + MONEY & SECURITIES + EQUIPMENT BREAKDOWN + OUTDOOR SIGNS + EMPLOYEE DISHONESTY + PUMPS/CANOPY)")
         print(f"{'='*70}\n")
         
         validations = results.get('building_validations', [])
@@ -972,6 +1084,55 @@ Return ONLY the JSON object. No other text.
                     notes = notes[:147] + "..."
                 print(f"  Notes: {notes if notes else 'N/A'}")
                 print()
+
+        # Display Pumps/Canopy validations (if present)
+        pc_validations = results.get('pumps_canopy_validations', [])
+        if pc_validations:
+            print(f"{'='*70}")
+            print("PUMPS / CANOPY VALIDATION RESULTS")
+            print(f"{'='*70}\n")
+
+            for v in pc_validations:
+                status = v.get('status', 'UNKNOWN')
+                cert_name = v.get('cert_pc_name', 'N/A')
+                cert_value = v.get('cert_pc_value', 'N/A')
+                policy_name = v.get('policy_pc_name', 'N/A')
+                policy_value = v.get('policy_pc_value', 'N/A')
+                policy_components = v.get('policy_pc_components', None)
+                policy_location = v.get('policy_location', 'N/A')
+                evidence_decl = v.get('evidence_declarations', 'N/A')
+                evidence_end = v.get('evidence_endorsements', None)
+                notes = v.get('notes', 'N/A')
+
+                if status == 'MATCH':
+                    icon = '✓'
+                elif status == 'MISMATCH':
+                    icon = '✗'
+                else:
+                    icon = '?'
+
+                print(f"{icon} {cert_name}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Value: {cert_value}")
+                print(f"  Policy Value: {policy_value}")
+                if policy_components:
+                    print(f"  Policy Components: {policy_components}")
+                print(f"  Policy Label: {policy_name}")
+                print(f"  Policy Location: {policy_location}")
+
+                if evidence_decl and len(evidence_decl) > 120:
+                    evidence_decl = evidence_decl[:117] + "..."
+                print(f"  Evidence (Declarations): {evidence_decl if evidence_decl else 'N/A'}")
+
+                if evidence_end:
+                    if len(evidence_end) > 120:
+                        evidence_end = evidence_end[:117] + "..."
+                    print(f"  Evidence (Endorsements): {evidence_end}")
+
+                if notes and len(notes) > 170:
+                    notes = notes[:167] + "..."
+                print(f"  Notes: {notes if notes else 'N/A'}")
+                print()
         
         # Print summary
         summary = results.get('summary', {})
@@ -1012,6 +1173,12 @@ Return ONLY the JSON object. No other text.
             print(f"  ✓ Matched:      {summary.get('ed_matched', 0)}")
             print(f"  ✗ Mismatched:   {summary.get('ed_mismatched', 0)}")
             print(f"  ? Not Found:    {summary.get('ed_not_found', 0)}")
+
+        if 'total_pc_items' in summary:
+            print(f"\nTotal Pumps/Canopy Items:  {summary.get('total_pc_items', 0)}")
+            print(f"  ✓ Matched:      {summary.get('pc_matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('pc_mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('pc_not_found', 0)}")
         
         if 'qc_notes' in results:
             qc_notes = results['qc_notes']
@@ -1025,7 +1192,7 @@ Return ONLY the JSON object. No other text.
 def main():
     """Main execution function"""
     # ========== EDIT THESE VALUES ==========
-    cert_prefix = "khsuhi"              # Change to: james, indian, etc.
+    cert_prefix = "znt"              # Change to: james, indian, etc.
     carrier_dir = "travelerop"      # Change to: hartfordop, encovaop, etc.
     # =======================================
     
