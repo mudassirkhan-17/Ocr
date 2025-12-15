@@ -55,6 +55,7 @@ class PolicyValidator:
             "location_address": cert_data.get("location_address")
         }
         
+        
         prompt = f"""You are an expert Policy Quality Control Specialist performing validation between a certificate and the actual policy document.
 
 ==================================================
@@ -152,13 +153,17 @@ When validating each field, you MUST:
 - May be labeled "Premises: 001 / Building: 001" with address below
 - If multiple locations exist, match the PRIMARY or MAIN location
 - If certificate specifies a specific address, find that exact location in the schedule
+- **CRITICAL:** STATE must match exactly (TX ≠ IN, CA ≠ CO) - different states = MISMATCH
+- City name and ZIP code must also match
+- Street format can vary ("Rd" vs "Road"), but city/state/zip must be correct
 
 **MATCHING TOLERANCE:**
-- **Exact Match Required:** Policy number
+- **Exact Match Required:** Policy number, State abbreviations in addresses (TX ≠ IN)
 - **Format Flexible:** Dates ("09/26/2025" = "9/26/2025")
-- **Abbreviations OK:** Addresses ("Rd" = "Road", "NW" = "Northwest")
-- **Case Insensitive:** Names and addresses
+- **Abbreviations OK:** Street types ("Rd" = "Road", "NW" = "Northwest", "St" = "Street")
+- **Case Insensitive:** Names ("Northpointe Bank" = "NORTHPOINTE BANK")
 - **Whitespace Flexible:** Extra spaces ignored
+- **NOT Flexible:** State codes in addresses must match exactly (different state = MISMATCH)
 
 ==================================================
 CERTIFICATE DATA (GROUND TRUTH)
@@ -392,6 +397,7 @@ Now analyze the policy document and return the validation JSON:"""
         validation_results = results.get('validation_results', {})
         
         for field_name, field_data in validation_results.items():
+            
             status = field_data.get('status', 'UNKNOWN')
             cert_value = field_data.get('certificate_value', 'N/A')
             policy_value = field_data.get('policy_value', 'N/A')
