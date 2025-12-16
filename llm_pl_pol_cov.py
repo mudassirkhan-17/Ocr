@@ -6,7 +6,7 @@ Handles multiple buildings using location address context
 
 import os
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -15,7 +15,7 @@ load_dotenv()
 
 
 class BuildingCoverageValidator:
-    """Validate Building + BPP + Money & Securities + Equipment Breakdown + Outdoor Signs + Employee Dishonesty + Pumps/Canopy coverages from certificate against policy (single LLM call)"""
+    """Validate Property coverages from certificate against policy (single LLM call)."""
     
     def __init__(self, model: str = "gpt-4o-mini"):
         """
@@ -319,8 +319,215 @@ class BuildingCoverageValidator:
             items.append({"name": canopy_key, "value": coverages.get(canopy_key)})
 
         return items
+
+    def extract_theft_coverages(self, cert_data: Dict) -> List[Dict]:
+        """
+        Extract Theft coverage from certificate.
+        Avoids keys like "Theft Deductible" which are not the coverage itself.
+        """
+        coverages = cert_data.get("coverages", {}) or {}
+        items: List[Dict] = []
+
+        for coverage_name, coverage_value in coverages.items():
+            name = (coverage_name or "").strip()
+            n = name.lower()
+
+            if "theft" not in n:
+                continue
+
+            # Exclude deductible-only rows/keys
+            if "deductible" in n or "ded." in n:
+                continue
+
+            # Keep only the core theft coverage entry
+            items.append({"name": name, "value": coverage_value})
+
+        return items
+
+    def extract_wind_hail_coverages(self, cert_data: Dict) -> List[Dict]:
+        """
+        Extract Wind/Hail (Windstorm & Hail) coverage from certificate.
+        Excludes deductible-only rows/keys (handled as notes during validation).
+        """
+        coverages = cert_data.get("coverages", {}) or {}
+        items: List[Dict] = []
+
+        for coverage_name, coverage_value in coverages.items():
+            name = (coverage_name or "").strip()
+            n = name.lower()
+
+            is_wind_hail = (
+                "wind" in n and "hail" in n
+            ) or ("windstorm" in n and "hail" in n) or ("windstorm" in n)
+
+            if not is_wind_hail:
+                continue
+
+            # Exclude deductible rows
+            if "deductible" in n or "ded." in n:
+                continue
+
+            items.append({"name": name, "value": coverage_value})
+
+        return items
+
+    def _norm_name(self, s: Optional[str]) -> str:
+        """Normalize coverage names for loose matching between requested items and LLM output."""
+        if not s:
+            return ""
+        s = s.lower()
+        # keep alphanumerics only to be robust to '&' vs 'and', punctuation, spacing
+        return "".join(ch for ch in s if ch.isalnum())
+
+    def _filter_validations_to_requested(
+        self,
+        validations: List[Dict],
+        requested_items: List[Dict],
+        cert_name_field: str,
+    ) -> List[Dict]:
+        """
+        Keep only validation entries that correspond to requested certificate items.
+        If no requested items exist, returns an empty list.
+        """
+        if not requested_items:
+            return []
+
+        requested_norms = [self._norm_name((it or {}).get("name")) for it in requested_items]
+        requested_norms = [x for x in requested_norms if x]
+        if not requested_norms:
+            return []
+
+        filtered: List[Dict] = []
+        for v in validations or []:
+            cert_name = self._norm_name((v or {}).get(cert_name_field))
+            if not cert_name:
+                continue
+
+            # Loose containment match either direction
+            if any(r in cert_name or cert_name in r for r in requested_norms):
+                filtered.append(v)
+
+        # If the LLM used unexpected labeling and nothing matched, fall back to
+        # taking the first N validations to avoid dropping real results.
+        if not filtered:
+            return list((validations or [])[: len(requested_items)])
+
+        # Prevent unexpected inflation: cap at number of requested items.
+        if len(filtered) > len(requested_items):
+            filtered = filtered[: len(requested_items)]
+
+        return filtered
+
+    def _recompute_summary_counts(self, results: Dict) -> None:
+        """Recompute summary counts from the validation arrays to avoid hallucinated totals."""
+        def _count(arr: List[Dict]) -> Dict[str, int]:
+            c = {"total": 0, "match": 0, "mismatch": 0, "not_found": 0}
+            for v in arr or []:
+                c["total"] += 1
+                s = (v.get("status") or "").upper()
+                if s == "MATCH":
+                    c["match"] += 1
+                elif s == "MISMATCH":
+                    c["mismatch"] += 1
+                elif s == "NOT_FOUND":
+                    c["not_found"] += 1
+            return c
+
+        summary = results.get("summary", {}) or {}
+
+        b = _count(results.get("building_validations", []))
+        summary.update(
+            {
+                "total_buildings": b["total"],
+                "matched": b["match"],
+                "mismatched": b["mismatch"],
+                "not_found": b["not_found"],
+            }
+        )
+
+        bpp = _count(results.get("bpp_validations", []))
+        summary.update(
+            {
+                "total_bpp_items": bpp["total"],
+                "bpp_matched": bpp["match"],
+                "bpp_mismatched": bpp["mismatch"],
+                "bpp_not_found": bpp["not_found"],
+            }
+        )
+
+        ms = _count(results.get("money_securities_validations", []))
+        summary.update(
+            {
+                "total_ms_items": ms["total"],
+                "ms_matched": ms["match"],
+                "ms_mismatched": ms["mismatch"],
+                "ms_not_found": ms["not_found"],
+            }
+        )
+
+        eb = _count(results.get("equipment_breakdown_validations", []))
+        summary.update(
+            {
+                "total_eb_items": eb["total"],
+                "eb_matched": eb["match"],
+                "eb_mismatched": eb["mismatch"],
+                "eb_not_found": eb["not_found"],
+            }
+        )
+
+        os = _count(results.get("outdoor_signs_validations", []))
+        summary.update(
+            {
+                "total_os_items": os["total"],
+                "os_matched": os["match"],
+                "os_mismatched": os["mismatch"],
+                "os_not_found": os["not_found"],
+            }
+        )
+
+        ed = _count(results.get("employee_dishonesty_validations", []))
+        summary.update(
+            {
+                "total_ed_items": ed["total"],
+                "ed_matched": ed["match"],
+                "ed_mismatched": ed["mismatch"],
+                "ed_not_found": ed["not_found"],
+            }
+        )
+
+        pc = _count(results.get("pumps_canopy_validations", []))
+        summary.update(
+            {
+                "total_pc_items": pc["total"],
+                "pc_matched": pc["match"],
+                "pc_mismatched": pc["mismatch"],
+                "pc_not_found": pc["not_found"],
+            }
+        )
+
+        theft = _count(results.get("theft_validations", []))
+        summary.update(
+            {
+                "total_theft_items": theft["total"],
+                "theft_matched": theft["match"],
+                "theft_mismatched": theft["mismatch"],
+                "theft_not_found": theft["not_found"],
+            }
+        )
+
+        wh = _count(results.get("wind_hail_validations", []))
+        summary.update(
+            {
+                "total_wind_hail_items": wh["total"],
+                "wind_hail_matched": wh["match"],
+                "wind_hail_mismatched": wh["mismatch"],
+                "wind_hail_not_found": wh["not_found"],
+            }
+        )
+
+        results["summary"] = summary
     
-    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], os_items: List[Dict], ed_items: List[Dict], pc_items: List[Dict], policy_text: str) -> str:
+    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], os_items: List[Dict], ed_items: List[Dict], pc_items: List[Dict], theft_items: List[Dict], wind_hail_items: List[Dict], policy_text: str) -> str:
         """
         Create validation prompt for Building coverages
         
@@ -347,7 +554,7 @@ CRITICAL INSTRUCTIONS
 ==================================================
 
 **YOUR TASK:**
-Validate BUILDING, Business Personal Property (BPP), Money & Securities, Equipment Breakdown, Outdoor Signs, Employee Dishonesty, and Pumps/Canopy coverages from the certificate against the policy document.
+Validate BUILDING, Business Personal Property (BPP), Money & Securities, Equipment Breakdown, Outdoor Signs, Employee Dishonesty, Pumps/Canopy, Theft, and Wind/Hail (Windstorm & Hail) from the certificate against the policy document.
 
 **CONTEXT FROM CERTIFICATE:**
 - Insured Name: {insured_name}
@@ -377,6 +584,12 @@ Validate BUILDING, Business Personal Property (BPP), Money & Securities, Equipme
 
 **PUMPS / CANOPY COVERAGES TO VALIDATE:**
 {json.dumps(pc_items, indent=2)}
+
+**THEFT COVERAGES TO VALIDATE:**
+{json.dumps(theft_items, indent=2)}
+
+**WIND / HAIL COVERAGES TO VALIDATE:**
+{json.dumps(wind_hail_items, indent=2)}
 
 ==================================================
 POLICY DOCUMENT (DUAL OCR SOURCES)
@@ -524,6 +737,36 @@ For EACH Pumps/Canopy item:
 - Evidence must include OCR source + page number for each component used in a sum match.
 
 ==================================================
+THEFT + WIND/HAIL VALIDATION RULES (ENCOVA-SAFE)
+==================================================
+
+These two are often NOT written as simple standalone lines. You MUST validate using the policy's per-premises/building "Causes of Loss" (Basic/Broad/Special) and any exclusions/endorsements.
+
+**IMPORTANT: HOW TO READ ENCOVA DECLARATIONS TABLES**
+- Many policies show a table with columns BASIC / BROAD / SPECIAL and an X/mark indicating which applies for a given premises/building.
+- You MUST quote the line(s) that show which causes of loss applies (OCR source + page).
+
+**THEFT (Peril inclusion)**
+- Theft is typically INCLUDED only when Causes of Loss is **SPECIAL** (unless excluded by endorsement).
+- If certificate says Theft = "Included":
+  - MATCH only if the policy shows **SPECIAL** for the relevant premises/building AND you do NOT find a Theft exclusion endorsement.
+  - If policy shows BASIC or BROAD for that premises/building, Theft is generally NOT included -> MISMATCH (unless a separate theft coverage endorsement explicitly adds it).
+- If certificate gives a Theft dollar limit (rare):
+  - MATCH only if the policy shows a theft sublimit/coverage limit specifically for Theft (not employee dishonesty/crime).
+- Do NOT confuse Theft with:
+  - "Theft Deductible" rows
+  - Employee Dishonesty / Employee Theft (crime/fidelity)
+
+**WIND/HAIL (Windstorm & Hail)**
+- Windstorm/Hail can appear as "Wind and Hail", "Wind & Hail", "Windstorm & Hail" and may be shown only as a deductible/percentage.
+- If certificate says Wind/Hail = "Included":
+  - MATCH if the policy includes wind/hail as a covered peril for the relevant premises/building (often via BASIC/BROAD/SPECIAL) and there is no wind/hail exclusion endorsement.
+  - If the policy only shows a Wind/Hail deductible/percentage, that still supports "Included" (capture it).
+- If certificate gives a Wind/Hail limit (rare):
+  - MATCH only if a specific wind/hail limit/sublimit is found and matches.
+- Evidence must cite causes-of-loss selection AND any deductible/exclusion language if present.
+
+==================================================
 OUTPUT FORMAT
 ==================================================
 
@@ -624,6 +867,33 @@ Return ONLY a valid JSON object with this structure:
       "notes": "Explain match method (direct vs sum) and why MATCH/MISMATCH/NOT_FOUND."
     }}
   ],
+  "theft_validations": [
+    {{
+      "cert_theft_name": "Name from certificate (e.g., 'Theft')",
+      "cert_theft_value": "Value from certificate (e.g., 'Included' or a limit)",
+      "status": "MATCH | MISMATCH | NOT_FOUND",
+      "policy_theft_value": "Included/Not Included/Limit or null",
+      "policy_causes_of_loss": "Basic | Broad | Special | Unknown",
+      "policy_location": "Premises/building description used",
+      "evidence_causes_of_loss": "Quote showing Basic/Broad/Special selection (OCR_SOURCE, Page X)",
+      "evidence_exclusions": "Quote from theft exclusion/endorsement if found, else null",
+      "notes": "Explain why theft is included or not (must reference causes-of-loss)."
+    }}
+  ],
+  "wind_hail_validations": [
+    {{
+      "cert_wind_hail_name": "Name from certificate (e.g., 'Wind and Hail')",
+      "cert_wind_hail_value": "Value from certificate (e.g., 'Included' or a limit)",
+      "status": "MATCH | MISMATCH | NOT_FOUND",
+      "policy_wind_hail_value": "Included/Excluded/Limit or null",
+      "policy_causes_of_loss": "Basic | Broad | Special | Unknown",
+      "policy_wind_hail_deductible": "If present (e.g., '1%') else null",
+      "policy_location": "Premises/building description used",
+      "evidence_causes_of_loss": "Quote showing Basic/Broad/Special selection (OCR_SOURCE, Page X)",
+      "evidence_deductible_or_endorsement": "Quote showing wind/hail deductible or exclusion/endorsement if present, else null",
+      "notes": "Explain why wind/hail is included/excluded and how you matched synonyms."
+    }}
+  ],
   "summary": {{
     "total_buildings": 0,
     "matched": 0,
@@ -652,7 +922,15 @@ Return ONLY a valid JSON object with this structure:
     "total_pc_items": 0,
     "pc_matched": 0,
     "pc_mismatched": 0,
-    "pc_not_found": 0
+    "pc_not_found": 0,
+    "total_theft_items": 0,
+    "theft_matched": 0,
+    "theft_mismatched": 0,
+    "theft_not_found": 0,
+    "total_wind_hail_items": 0,
+    "wind_hail_matched": 0,
+    "wind_hail_mismatched": 0,
+    "wind_hail_not_found": 0
   }},
   "qc_notes": "Overall observations about the validation"
 }}
@@ -691,7 +969,7 @@ Return ONLY the JSON object. No other text.
         with open(cert_json_path, 'r', encoding='utf-8') as f:
             cert_data = json.load(f)
         
-        # Extract building + BPP + Money & Securities + Equipment Breakdown + Outdoor Signs + Employee Dishonesty + Pumps/Canopy coverages (single LLM call)
+        # Extract coverages to validate (single LLM call)
         buildings = self.extract_building_coverages(cert_data)
         bpp_items = self.extract_bpp_coverages(cert_data)
         ms_items = self.extract_money_securities_coverages(cert_data)
@@ -699,9 +977,21 @@ Return ONLY the JSON object. No other text.
         os_items = self.extract_outdoor_signs_coverages(cert_data)
         ed_items = self.extract_employee_dishonesty_coverages(cert_data)
         pc_items = self.extract_pumps_canopy_coverages(cert_data)
+        theft_items = self.extract_theft_coverages(cert_data)
+        wind_hail_items = self.extract_wind_hail_coverages(cert_data)
         
-        if not buildings and not bpp_items and not ms_items and not eb_items and not os_items and not ed_items and not pc_items:
-            print("      ❌ No supported coverages found in certificate (Building/BPP/Money&Sec/EquipBreak/OutdoorSigns/EmployeeDishonesty/PumpsCanopy)!")
+        if (
+            not buildings
+            and not bpp_items
+            and not ms_items
+            and not eb_items
+            and not os_items
+            and not ed_items
+            and not pc_items
+            and not theft_items
+            and not wind_hail_items
+        ):
+            print("      ❌ No supported coverages found in certificate!")
             print("      Certificate may be GL policy or missing coverage data.")
             return
         
@@ -733,6 +1023,14 @@ Return ONLY the JSON object. No other text.
             print(f"      Found {len(pc_items)} Pumps/Canopy coverage(s):")
             for p in pc_items:
                 print(f"        - {p['name']}: {p['value']}")
+        if theft_items:
+            print(f"      Found {len(theft_items)} Theft coverage(s):")
+            for t in theft_items:
+                print(f"        - {t['name']}: {t['value']}")
+        if wind_hail_items:
+            print(f"      Found {len(wind_hail_items)} Wind/Hail coverage(s):")
+            for w in wind_hail_items:
+                print(f"        - {w['name']}: {w['value']}")
         
         # Load policy
         print(f"\n[2/5] Loading policy: {policy_combo_path}")
@@ -744,7 +1042,19 @@ Return ONLY the JSON object. No other text.
         
         # Create prompt
         print(f"\n[3/5] Creating validation prompt...")
-        prompt = self.create_validation_prompt(cert_data, buildings, bpp_items, ms_items, eb_items, os_items, ed_items, pc_items, policy_text)
+        prompt = self.create_validation_prompt(
+            cert_data,
+            buildings,
+            bpp_items,
+            ms_items,
+            eb_items,
+            os_items,
+            ed_items,
+            pc_items,
+            theft_items,
+            wind_hail_items,
+            policy_text,
+        )
         prompt_size_kb = len(prompt) / 1024
         print(f"      Prompt size: {prompt_size_kb:.1f} KB")
         
@@ -775,6 +1085,56 @@ Return ONLY the JSON object. No other text.
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens
             }
+
+            # Guardrail: keep only validations for items actually present in the certificate extraction.
+            # This prevents the model from "helpfully" validating extra coverages found in the policy.
+            results["building_validations"] = self._filter_validations_to_requested(
+                results.get("building_validations", []),
+                buildings,
+                "cert_building_name",
+            )
+            results["bpp_validations"] = self._filter_validations_to_requested(
+                results.get("bpp_validations", []),
+                bpp_items,
+                "cert_bpp_name",
+            )
+            results["money_securities_validations"] = self._filter_validations_to_requested(
+                results.get("money_securities_validations", []),
+                ms_items,
+                "cert_ms_name",
+            )
+            results["equipment_breakdown_validations"] = self._filter_validations_to_requested(
+                results.get("equipment_breakdown_validations", []),
+                eb_items,
+                "cert_eb_name",
+            )
+            results["outdoor_signs_validations"] = self._filter_validations_to_requested(
+                results.get("outdoor_signs_validations", []),
+                os_items,
+                "cert_os_name",
+            )
+            results["employee_dishonesty_validations"] = self._filter_validations_to_requested(
+                results.get("employee_dishonesty_validations", []),
+                ed_items,
+                "cert_ed_name",
+            )
+            results["pumps_canopy_validations"] = self._filter_validations_to_requested(
+                results.get("pumps_canopy_validations", []),
+                pc_items,
+                "cert_pc_name",
+            )
+            results["theft_validations"] = self._filter_validations_to_requested(
+                results.get("theft_validations", []),
+                theft_items,
+                "cert_theft_name",
+            )
+            results["wind_hail_validations"] = self._filter_validations_to_requested(
+                results.get("wind_hail_validations", []),
+                wind_hail_items,
+                "cert_wind_hail_name",
+            )
+
+            self._recompute_summary_counts(results)
             
             print(f"      ✓ LLM validation complete")
             print(f"      Tokens used: {response.usage.total_tokens:,} (prompt: {response.usage.prompt_tokens:,}, completion: {response.usage.completion_tokens:,})")
@@ -803,7 +1163,7 @@ Return ONLY the JSON object. No other text.
     def display_results(self, results: Dict):
         """Display validation results on console"""
         print(f"\n{'='*70}")
-        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + MONEY & SECURITIES + EQUIPMENT BREAKDOWN + OUTDOOR SIGNS + EMPLOYEE DISHONESTY + PUMPS/CANOPY)")
+        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + MONEY & SECURITIES + EQUIPMENT BREAKDOWN + OUTDOOR SIGNS + EMPLOYEE DISHONESTY + PUMPS/CANOPY + THEFT + WIND/HAIL)")
         print(f"{'='*70}\n")
         
         validations = results.get('building_validations', [])
@@ -1133,6 +1493,101 @@ Return ONLY the JSON object. No other text.
                     notes = notes[:167] + "..."
                 print(f"  Notes: {notes if notes else 'N/A'}")
                 print()
+
+        # Display Theft validations (if present)
+        theft_validations = results.get('theft_validations', [])
+        if theft_validations:
+            print(f"{'='*70}")
+            print("THEFT VALIDATION RESULTS")
+            print(f"{'='*70}\n")
+
+            for v in theft_validations:
+                status = v.get('status', 'UNKNOWN')
+                cert_name = v.get('cert_theft_name', 'N/A')
+                cert_value = v.get('cert_theft_value', 'N/A')
+                policy_value = v.get('policy_theft_value', 'N/A')
+                causes = v.get('policy_causes_of_loss', 'Unknown')
+                policy_location = v.get('policy_location', 'N/A')
+                evidence_col = v.get('evidence_causes_of_loss', 'N/A')
+                evidence_excl = v.get('evidence_exclusions', None)
+                notes = v.get('notes', 'N/A')
+
+                if status == 'MATCH':
+                    icon = '✓'
+                elif status == 'MISMATCH':
+                    icon = '✗'
+                else:
+                    icon = '?'
+
+                print(f"{icon} {cert_name}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Value: {cert_value}")
+                print(f"  Policy Value: {policy_value}")
+                print(f"  Causes of Loss: {causes}")
+                print(f"  Policy Location: {policy_location}")
+
+                if evidence_col and len(evidence_col) > 140:
+                    evidence_col = evidence_col[:137] + "..."
+                print(f"  Evidence (Causes of Loss): {evidence_col if evidence_col else 'N/A'}")
+
+                if evidence_excl:
+                    if len(evidence_excl) > 140:
+                        evidence_excl = evidence_excl[:137] + "..."
+                    print(f"  Evidence (Exclusions/Endorsements): {evidence_excl}")
+
+                if notes and len(notes) > 170:
+                    notes = notes[:167] + "..."
+                print(f"  Notes: {notes if notes else 'N/A'}")
+                print()
+
+        # Display Wind/Hail validations (if present)
+        wh_validations = results.get('wind_hail_validations', [])
+        if wh_validations:
+            print(f"{'='*70}")
+            print("WIND / HAIL VALIDATION RESULTS")
+            print(f"{'='*70}\n")
+
+            for v in wh_validations:
+                status = v.get('status', 'UNKNOWN')
+                cert_name = v.get('cert_wind_hail_name', 'N/A')
+                cert_value = v.get('cert_wind_hail_value', 'N/A')
+                policy_value = v.get('policy_wind_hail_value', 'N/A')
+                causes = v.get('policy_causes_of_loss', 'Unknown')
+                deductible = v.get('policy_wind_hail_deductible', None)
+                policy_location = v.get('policy_location', 'N/A')
+                evidence_col = v.get('evidence_causes_of_loss', 'N/A')
+                evidence_other = v.get('evidence_deductible_or_endorsement', None)
+                notes = v.get('notes', 'N/A')
+
+                if status == 'MATCH':
+                    icon = '✓'
+                elif status == 'MISMATCH':
+                    icon = '✗'
+                else:
+                    icon = '?'
+
+                print(f"{icon} {cert_name}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Value: {cert_value}")
+                print(f"  Policy Value: {policy_value}")
+                print(f"  Causes of Loss: {causes}")
+                if deductible:
+                    print(f"  Wind/Hail Deductible: {deductible}")
+                print(f"  Policy Location: {policy_location}")
+
+                if evidence_col and len(evidence_col) > 140:
+                    evidence_col = evidence_col[:137] + "..."
+                print(f"  Evidence (Causes of Loss): {evidence_col if evidence_col else 'N/A'}")
+
+                if evidence_other:
+                    if len(evidence_other) > 140:
+                        evidence_other = evidence_other[:137] + "..."
+                    print(f"  Evidence (Deductible/Endorsement): {evidence_other}")
+
+                if notes and len(notes) > 170:
+                    notes = notes[:167] + "..."
+                print(f"  Notes: {notes if notes else 'N/A'}")
+                print()
         
         # Print summary
         summary = results.get('summary', {})
@@ -1179,6 +1634,18 @@ Return ONLY the JSON object. No other text.
             print(f"  ✓ Matched:      {summary.get('pc_matched', 0)}")
             print(f"  ✗ Mismatched:   {summary.get('pc_mismatched', 0)}")
             print(f"  ? Not Found:    {summary.get('pc_not_found', 0)}")
+
+        if 'total_theft_items' in summary:
+            print(f"\nTotal Theft Items:  {summary.get('total_theft_items', 0)}")
+            print(f"  ✓ Matched:      {summary.get('theft_matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('theft_mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('theft_not_found', 0)}")
+
+        if 'total_wind_hail_items' in summary:
+            print(f"\nTotal Wind/Hail Items:  {summary.get('total_wind_hail_items', 0)}")
+            print(f"  ✓ Matched:      {summary.get('wind_hail_matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('wind_hail_mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('wind_hail_not_found', 0)}")
         
         if 'qc_notes' in results:
             qc_notes = results['qc_notes']
@@ -1192,8 +1659,8 @@ Return ONLY the JSON object. No other text.
 def main():
     """Main execution function"""
     # ========== EDIT THESE VALUES ==========
-    cert_prefix = "znt"              # Change to: james, indian, etc.
-    carrier_dir = "travelerop"      # Change to: hartfordop, encovaop, etc.
+    cert_prefix = "salem"              # Change to: james, indian, etc.
+    carrier_dir = "encovaop"      # Change to: hartfordop, encovaop, etc.
     # =======================================
     
     # Construct paths
