@@ -371,6 +371,33 @@ class BuildingCoverageValidator:
 
         return items
 
+    def extract_business_income_coverages(self, cert_data: Dict) -> List[Dict]:
+        """
+        Extract Business Income coverages from certificate.
+
+        Notes:
+        - May appear once or repeated for multiple locations/buildings.
+        - Value can be a dollar limit (e.g., "150,000") or "Actual Loss Sustained".
+        - Avoid deductible rows/keys.
+        """
+        coverages = cert_data.get("coverages", {}) or {}
+        items: List[Dict] = []
+
+        for coverage_name, coverage_value in coverages.items():
+            name = (coverage_name or "").strip()
+            n = name.lower()
+
+            if "business income" not in n:
+                continue
+
+            # Exclude deductibles or waiting period-only lines if they appear as keys
+            if "deductible" in n or "ded." in n or "waiting" in n:
+                continue
+
+            items.append({"name": name, "value": coverage_value})
+
+        return items
+
     def _norm_name(self, s: Optional[str]) -> str:
         """Normalize coverage names for loose matching between requested items and LLM output."""
         if not s:
@@ -455,6 +482,16 @@ class BuildingCoverageValidator:
             }
         )
 
+        bi = _count(results.get("business_income_validations", []))
+        summary.update(
+            {
+                "total_bi_items": bi["total"],
+                "bi_matched": bi["match"],
+                "bi_mismatched": bi["mismatch"],
+                "bi_not_found": bi["not_found"],
+            }
+        )
+
         ms = _count(results.get("money_securities_validations", []))
         summary.update(
             {
@@ -527,7 +564,7 @@ class BuildingCoverageValidator:
 
         results["summary"] = summary
     
-    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], os_items: List[Dict], ed_items: List[Dict], pc_items: List[Dict], theft_items: List[Dict], wind_hail_items: List[Dict], policy_text: str) -> str:
+    def create_validation_prompt(self, cert_data: Dict, buildings: List[Dict], bpp_items: List[Dict], bi_items: List[Dict], ms_items: List[Dict], eb_items: List[Dict], os_items: List[Dict], ed_items: List[Dict], pc_items: List[Dict], theft_items: List[Dict], wind_hail_items: List[Dict], policy_text: str) -> str:
         """
         Create validation prompt for Building coverages
         
@@ -554,7 +591,7 @@ CRITICAL INSTRUCTIONS
 ==================================================
 
 **YOUR TASK:**
-Validate BUILDING, Business Personal Property (BPP), Money & Securities, Equipment Breakdown, Outdoor Signs, Employee Dishonesty, Pumps/Canopy, Theft, and Wind/Hail (Windstorm & Hail) from the certificate against the policy document.
+Validate BUILDING, Business Personal Property (BPP), Business Income, Money & Securities, Equipment Breakdown, Outdoor Signs, Employee Dishonesty, Pumps/Canopy, Theft, and Wind/Hail (Windstorm & Hail) from the certificate against the policy document.
 
 **CONTEXT FROM CERTIFICATE:**
 - Insured Name: {insured_name}
@@ -569,6 +606,9 @@ Validate BUILDING, Business Personal Property (BPP), Money & Securities, Equipme
 
 **BPP COVERAGES TO VALIDATE:**
 {json.dumps(bpp_items, indent=2)}
+
+**BUSINESS INCOME COVERAGES TO VALIDATE:**
+{json.dumps(bi_items, indent=2)}
 
 **MONEY & SECURITIES COVERAGES TO VALIDATE:**
 {json.dumps(ms_items, indent=2)}
@@ -654,6 +694,24 @@ If the certificate has multiple buildings (e.g., "Building", "Building 2", "Buil
 The location address in the certificate tells you WHICH building to look for:
 - If policy has multiple premises, find the one matching the certificate location
 - Focus on that specific building's limit
+
+==================================================
+BUSINESS INCOME VALIDATION RULES (STRICT)
+==================================================
+
+For EACH Business Income item (STRICT LOCATION MATCHING):
+- Business Income may be listed per location/building in the certificate (e.g., repeated for Location 01 and Location 02). You MUST match the correct premises/building context in the policy.
+- If certificate value is "Actual Loss Sustained" (or similar like "A.L.S."):
+  - MATCH if the policy indicates Business Income is Actual Loss Sustained (or no stated dollar limit and clearly ALS form applies) for that location/building.
+  - MISMATCH if the policy clearly shows a specific dollar limit and it conflicts with ALS representation.
+- If certificate value is a dollar limit:
+  - MATCH if the policy's Business Income limit matches for that location/building (ignore $/commas/spacing).
+- If the policy lists Business Income as part of a combined "Business Income and Extra Expense" or similar, capture the effective BI representation and explain in notes.
+- Waiting period/deductible supports inclusion but is NOT the BI limit; capture it as context.
+- Do NOT confuse Business Income with:
+  - Extra Expense only
+  - Rental Value (unless the certificate explicitly says it)
+  - Waiting period / deductible entries (these are not the limit)
 
 ==================================================
 MONEY & SECURITIES VALIDATION RULES (STRICT)
@@ -800,6 +858,20 @@ Return ONLY a valid JSON object with this structure:
       "notes": "How you matched location/premises and why MATCH/MISMATCH/NOT_FOUND (avoid matching sublimits/extensions)."
     }}
   ],
+  "business_income_validations": [
+    {{
+      "cert_bi_name": "Name from certificate (e.g., 'Business Income', 'Business Income - Location 01')",
+      "cert_bi_value": "Value from certificate (e.g., '150,000' or 'Actual Loss Sustained')",
+      "status": "MATCH | MISMATCH | NOT_FOUND",
+      "policy_bi_name": "How it appears in policy (e.g., 'Business Income', 'Business Income and Extra Expense')",
+      "policy_bi_value": "Policy value (ALS/Included or a dollar limit) or null",
+      "policy_bi_waiting_period": "If present (e.g., '72 hours') else null",
+      "policy_location": "Location/premises/building description from policy (or null if policy-wide)",
+      "evidence_declarations": "Quote from declarations/coverage schedule (OCR_SOURCE, Page X)",
+      "evidence_endorsements": "Quote from any modifying endorsement (OCR_SOURCE, Page X) or null",
+      "notes": "Explain how you matched location/building and why MATCH/MISMATCH/NOT_FOUND."
+    }}
+  ],
   "money_securities_validations": [
     {{
       "cert_ms_name": "Name from certificate (e.g., 'Money & Securities')",
@@ -903,6 +975,10 @@ Return ONLY a valid JSON object with this structure:
     "bpp_matched": 0,
     "bpp_mismatched": 0,
     "bpp_not_found": 0,
+    "total_bi_items": 0,
+    "bi_matched": 0,
+    "bi_mismatched": 0,
+    "bi_not_found": 0,
     "total_ms_items": 0,
     "ms_matched": 0,
     "ms_mismatched": 0,
@@ -972,6 +1048,7 @@ Return ONLY the JSON object. No other text.
         # Extract coverages to validate (single LLM call)
         buildings = self.extract_building_coverages(cert_data)
         bpp_items = self.extract_bpp_coverages(cert_data)
+        bi_items = self.extract_business_income_coverages(cert_data)
         ms_items = self.extract_money_securities_coverages(cert_data)
         eb_items = self.extract_equipment_breakdown_coverages(cert_data)
         os_items = self.extract_outdoor_signs_coverages(cert_data)
@@ -983,6 +1060,7 @@ Return ONLY the JSON object. No other text.
         if (
             not buildings
             and not bpp_items
+            and not bi_items
             and not ms_items
             and not eb_items
             and not os_items
@@ -1002,6 +1080,10 @@ Return ONLY the JSON object. No other text.
         if bpp_items:
             print(f"      Found {len(bpp_items)} BPP coverage(s):")
             for b in bpp_items:
+                print(f"        - {b['name']}: {b['value']}")
+        if bi_items:
+            print(f"      Found {len(bi_items)} Business Income coverage(s):")
+            for b in bi_items:
                 print(f"        - {b['name']}: {b['value']}")
         if ms_items:
             print(f"      Found {len(ms_items)} Money & Securities coverage(s):")
@@ -1046,6 +1128,7 @@ Return ONLY the JSON object. No other text.
             cert_data,
             buildings,
             bpp_items,
+            bi_items,
             ms_items,
             eb_items,
             os_items,
@@ -1097,6 +1180,11 @@ Return ONLY the JSON object. No other text.
                 results.get("bpp_validations", []),
                 bpp_items,
                 "cert_bpp_name",
+            )
+            results["business_income_validations"] = self._filter_validations_to_requested(
+                results.get("business_income_validations", []),
+                bi_items,
+                "cert_bi_name",
             )
             results["money_securities_validations"] = self._filter_validations_to_requested(
                 results.get("money_securities_validations", []),
@@ -1163,7 +1251,7 @@ Return ONLY the JSON object. No other text.
     def display_results(self, results: Dict):
         """Display validation results on console"""
         print(f"\n{'='*70}")
-        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + MONEY & SECURITIES + EQUIPMENT BREAKDOWN + OUTDOOR SIGNS + EMPLOYEE DISHONESTY + PUMPS/CANOPY + THEFT + WIND/HAIL)")
+        print("COVERAGE VALIDATION RESULTS (BUILDING + BPP + BUSINESS INCOME + MONEY & SECURITIES + EQUIPMENT BREAKDOWN + OUTDOOR SIGNS + EMPLOYEE DISHONESTY + PUMPS/CANOPY + THEFT + WIND/HAIL)")
         print(f"{'='*70}\n")
         
         validations = results.get('building_validations', [])
@@ -1243,6 +1331,55 @@ Return ONLY the JSON object. No other text.
                 print(f"  Policy Label: {policy_name}")
                 print(f"  Policy Location: {policy_location}")
                 print(f"  Policy Prem/Building: {policy_pb}")
+
+                if evidence_decl and len(evidence_decl) > 100:
+                    evidence_decl = evidence_decl[:97] + "..."
+                print(f"  Evidence (Declarations): {evidence_decl if evidence_decl else 'N/A'}")
+
+                if evidence_end:
+                    if len(evidence_end) > 100:
+                        evidence_end = evidence_end[:97] + "..."
+                    print(f"  Evidence (Endorsements): {evidence_end}")
+
+                if notes and len(notes) > 150:
+                    notes = notes[:147] + "..."
+                print(f"  Notes: {notes if notes else 'N/A'}")
+                print()
+
+        # Display Business Income validations (if present)
+        bi_validations = results.get('business_income_validations', [])
+        if bi_validations:
+            print(f"{'='*70}")
+            print("BUSINESS INCOME VALIDATION RESULTS")
+            print(f"{'='*70}\n")
+
+            for v in bi_validations:
+                status = v.get('status', 'UNKNOWN')
+                cert_name = v.get('cert_bi_name', 'N/A')
+                cert_value = v.get('cert_bi_value', 'N/A')
+                policy_name = v.get('policy_bi_name', 'N/A')
+                policy_value = v.get('policy_bi_value', 'N/A')
+                waiting = v.get('policy_bi_waiting_period', None)
+                policy_location = v.get('policy_location', 'N/A')
+                evidence_decl = v.get('evidence_declarations', 'N/A')
+                evidence_end = v.get('evidence_endorsements', None)
+                notes = v.get('notes', 'N/A')
+
+                if status == 'MATCH':
+                    icon = '✓'
+                elif status == 'MISMATCH':
+                    icon = '✗'
+                else:
+                    icon = '?'
+
+                print(f"{icon} {cert_name}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Value: {cert_value}")
+                print(f"  Policy Value: {policy_value}")
+                if waiting:
+                    print(f"  Waiting Period: {waiting}")
+                print(f"  Policy Label: {policy_name}")
+                print(f"  Policy Location: {policy_location}")
 
                 if evidence_decl and len(evidence_decl) > 100:
                     evidence_decl = evidence_decl[:97] + "..."
@@ -1605,6 +1742,12 @@ Return ONLY the JSON object. No other text.
             print(f"  ✗ Mismatched:   {summary.get('bpp_mismatched', 0)}")
             print(f"  ? Not Found:    {summary.get('bpp_not_found', 0)}")
 
+        if 'total_bi_items' in summary:
+            print(f"\nTotal Business Income Items:  {summary.get('total_bi_items', 0)}")
+            print(f"  ✓ Matched:      {summary.get('bi_matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('bi_mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('bi_not_found', 0)}")
+
         if 'total_ms_items' in summary:
             print(f"\nTotal Money & Securities Items:  {summary.get('total_ms_items', 0)}")
             print(f"  ✓ Matched:      {summary.get('ms_matched', 0)}")
@@ -1659,8 +1802,8 @@ Return ONLY the JSON object. No other text.
 def main():
     """Main execution function"""
     # ========== EDIT THESE VALUES ==========
-    cert_prefix = "salem"              # Change to: james, indian, etc.
-    carrier_dir = "encovaop"      # Change to: hartfordop, encovaop, etc.
+    cert_prefix = "stay"              # Change to: james, indian, etc.
+    carrier_dir = "nationwideop"      # Change to: hartfordop, encovaop, etc.
     # =======================================
     
     # Construct paths
