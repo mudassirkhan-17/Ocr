@@ -22,6 +22,24 @@ from datetime import datetime
 class PolicyPageExtractor:
     """Extract pages from policy OCR text with filtering"""
     
+    # Keywords for additional interest/insured filtering
+    ADDITIONAL_INTEREST_KEYWORDS = [
+        "additional interest",
+        "additional interests",
+        "additional insured",
+        "additional insureds",
+        "mortgagee",
+        "mortgage holder",
+        "mortgage holders",
+        "mortgagees",
+        "loss payee",
+        "loss payable",
+        "lienholder",
+        "lien holder",
+        "secured party",
+        "secured parties",
+    ]
+    
     def __init__(self, policy_text: str, filename: str):
         """Initialize with policy text and filename"""
         self.policy_text = policy_text
@@ -119,6 +137,20 @@ class PolicyPageExtractor:
         
         return sorted(pages_with_dollars)
     
+    def find_pages_with_keywords(self) -> List[int]:
+        """Find pages that contain additional interest/insured keywords"""
+        pages_with_keywords = set()
+        
+        for page_num, (page_start, page_end) in self.page_boundaries.items():
+            page_text = self.policy_text[page_start:page_end]
+            page_text_lower = page_text.lower()
+            
+            # Check if any keyword appears in this page
+            if any(keyword in page_text_lower for keyword in self.ADDITIONAL_INTEREST_KEYWORDS):
+                pages_with_keywords.add(page_num)
+        
+        return sorted(pages_with_keywords)
+    
     def merge_page_ranges(self, pages: List[int], buffer: int = 1) -> List[Tuple[int, int]]:
         """Add buffer pages and merge overlapping ranges"""
         if not pages:
@@ -146,16 +178,22 @@ class PolicyPageExtractor:
         return merged
     
     def extract_filtered_pages(self) -> str:
-        """Extract only pages with dollar amounts (filtered content)"""
-        # Find pages with dollar amounts
+        """Extract only pages with dollar amounts OR additional interest keywords (filtered content)"""
+        # Find pages with dollar amounts (existing logic - unchanged)
         dollar_pages = self.find_pages_with_dollar_amounts()
         
-        if not dollar_pages:
-            print(f"  ⚠️  No pages with $ amounts found, returning empty")
+        # Find pages with keywords (new)
+        keyword_pages = self.find_pages_with_keywords()
+        
+        # Combine both: union of dollar pages and keyword pages
+        combined_pages = sorted(set(dollar_pages) | set(keyword_pages))
+        
+        if not combined_pages:
+            print(f"  ⚠️  No pages with $ amounts or additional interest keywords found, returning empty")
             return ""
         
         # Merge ranges with buffer
-        merged_ranges = self.merge_page_ranges(dollar_pages, buffer=1)
+        merged_ranges = self.merge_page_ranges(combined_pages, buffer=1)
         
         # Extract pages from each range
         filtered_text = ""
@@ -217,7 +255,11 @@ def filter_policy_file(input_file: Path, output_file: Path) -> bool:
         f.write(filtered_text)
     
     filtered_chars = len(filtered_text)
-    reduction = ((total_pages - len(extractor.find_pages_with_dollar_amounts())) / total_pages * 100) if total_pages > 0 else 0
+    # Calculate reduction based on combined pages (dollar + keyword)
+    dollar_pages = extractor.find_pages_with_dollar_amounts()
+    keyword_pages = extractor.find_pages_with_keywords()
+    combined_pages = sorted(set(dollar_pages) | set(keyword_pages))
+    reduction = ((total_pages - len(combined_pages)) / total_pages * 100) if total_pages > 0 else 0
     
     print(f"     ✅ Saved {filtered_chars:,} characters")
     print(f"     📉 Reduction: ~{reduction:.1f}%")
@@ -242,12 +284,12 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "znt"
+        input_name = "aaniya"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
     
     # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
-    carrier_dir = "travelerop"
+    carrier_dir = "encovaop"
     
     # Extract base name
     base_name = extract_base_name(input_name)

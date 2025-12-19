@@ -358,12 +358,12 @@ def main():
     # Get input file
     if len(sys.argv) < 2:
         print("⚠️  No input provided, using default: aaniya_gl")
-        base_name = "ameen_gl"
+        base_name = "westside_gl"
     else:
         base_name = sys.argv[1]
     
     # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
-    carrier_dir = "hartfordop"
+    carrier_dir = "nationwideop"
     
     # Look for the combo file (best extraction)
     # NOTE: for GL we typically use base names like "aaniya_gl" so the file becomes "aaniya_gl_combo.txt"

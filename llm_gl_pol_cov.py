@@ -617,9 +617,9 @@ Return ONLY this JSON object:
 
 def main() -> None:
     # ========== EDIT THESE VALUES ==========
-    carrier_dir = "encovaop"        # encovaop, hartfordop, nationwideop, travelerop, ...
-    cert_prefix = "khwaish_gl"       # e.g. aaniya_gl, ambama_gl, evergreen_gl
-    policy_prefix = "khwaish"        # base name used for policy combo, e.g. aaniya -> aaniya_pol_combo.txt
+    carrier_dir = "nationwideop"        # encovaop, hartfordop, nationwideop, travelerop, ...
+    cert_prefix = "westside_gl"       # e.g. aaniya_gl, ambama_gl, evergreen_gl
+    policy_prefix = "westside"        # base name used for policy combo, e.g. aaniya -> aaniya_pol_combo.txt
     # =======================================
 
     cert_json_path = os.path.join(carrier_dir, f"{cert_prefix}_extracted_real.json")
