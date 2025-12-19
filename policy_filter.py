@@ -284,7 +284,7 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "aaniya"
+        input_name = "baltic"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
     
