@@ -420,6 +420,32 @@ Return ONLY the JSON object. No other text.
         
         if not ms_items and not ed_items:
             print("      ❌ No Money & Securities or Employee Dishonesty coverages found in certificate!")
+            # Create empty results file to prevent FileNotFoundError in pipeline
+            empty_results = {
+                "money_securities_validations": [],
+                "employee_dishonesty_validations": [],
+                "summary": {
+                    "total_ms_items": 0,
+                    "ms_matched": 0,
+                    "ms_mismatched": 0,
+                    "ms_not_found": 0,
+                    "total_ed_items": 0,
+                    "ed_matched": 0,
+                    "ed_mismatched": 0,
+                    "ed_not_found": 0
+                },
+                "qc_notes": "No Money & Securities or Employee Dishonesty coverages found in certificate.",
+                "metadata": {
+                    "model": self.model,
+                    "certificate_file": cert_json_path,
+                    "policy_file": policy_combo_path,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                }
+            }
+            self.save_validation_results(empty_results, output_path)
+            print(f"      ✓ Empty results file created at: {output_path}")
             return
         
         if ms_items:

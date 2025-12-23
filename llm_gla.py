@@ -76,8 +76,11 @@ class CertificateExtractor:
             Formatted prompt string
         """
         if pymupdf_text:
-            # Dual extraction mode - cross-validation (ACORD 25 - GL)
-            prompt = """You are an expert in ACORD 25 (Certificate of Liability Insurance) extraction.
+            # Dual extraction mode - cross-validation (ACORD GL forms)
+            prompt = """You are an expert in ACORD insurance form extraction, including:
+- ACORD 25 (Certificate of Liability Insurance)
+- ACORD Commercial General Liability Section forms
+- Other ACORD GL-related forms
 
 You are given TWO extraction sources for the SAME document:
 1. **PDFPLUMBER (Table-aware)**: Preserves table structure - USE THIS AS PRIMARY SOURCE for coverage data
@@ -85,6 +88,22 @@ You are given TWO extraction sources for the SAME document:
 
 **PRIORITY**: For coverage extraction, prioritize pdfplumber's TABLE sections (especially TABLE 2 which contains the coverage table).
 Cross-validate with PyMuPDF text when needed, but trust pdfplumber's structured table data first.
+
+**IMPORTANT - FORM TYPE DETECTION**:
+- If you see "COMMERCIAL GENERAL LIABILITY SECTION" as the title, this is a policy application/section form (not a certificate)
+- If you see "CERTIFICATE OF LIABILITY INSURANCE" or "ACORD 25", this is a certificate
+- Both forms contain coverage information, but the layout differs:
+  * **Certificate (ACORD 25)**: Coverage data is in a table with columns (POLICY NUMBER, LIMITS, DATES, etc.)
+  * **Section Form**: Coverage data is in a "COVERAGES" and "LIMITS" section with checkboxes and dollar amounts
+
+**⚠️⚠️⚠️ CRITICAL FOR SECTION FORMS - LIMIT EXTRACTION ⚠️⚠️⚠️**:
+- In section forms, limits appear as **TEXT PATTERNS**, NOT in structured tables
+- Look for lines like: "GENERAL AGGREGATE $ 2,000,000" or "EACH OCCURRENCE $ 1,000,000"
+- The format is: [LIMIT NAME] $ [AMOUNT] (e.g., "GENERAL AGGREGATE $ 2,000,000")
+- **YOU MUST SEARCH THE TEXT FOR THESE PATTERNS** - they are clearly visible in the extraction
+- Extract the NUMERIC VALUE ONLY (remove "$" and spaces) - e.g., "2,000,000" not "$ 2,000,000"
+- **DO NOT RETURN NULL** if you see these patterns in the text - extract them!
+- The limits may appear on the same line or across multiple lines - search carefully
 
 **CRITICAL - HIDDEN/TEMPLATE TEXT WARNING**:
 - Both pdfplumber and PyMuPDF may extract hidden/template text that is NOT visible on the actual certificate
@@ -172,22 +191,46 @@ Return ONLY a valid JSON object with:
 - If 2+ certificate holders (rare; schedule/attachments):
   - certificate_holders: [{"name": "...", "address": "..."}, ...]
 
-3) GL coverages (ACORD 25 coverages table):
+3) GL coverages:
+- **For Certificates (ACORD 25)**: Extract from the coverages table with columns (POLICY NUMBER, LIMITS, DATES, etc.)
+- **For Section Forms**: Extract from the "COVERAGES" and "LIMITS" sections where:
+  * Checkboxes indicate which coverages are selected (e.g., "COMMERCIAL GENERAL LIABILITY" checked)
+  * "CLAIMS MADE" vs "OCCURRENCE" checkboxes indicate the coverage type
+  * **CRITICAL**: Dollar amounts in the "LIMITS" section appear as TEXT, NOT in a table structure
+  * Look for these patterns in the text (they may appear on the same line or across multiple lines):
+    - "GENERAL AGGREGATE $ 2,000,000" → general_aggregate: "2,000,000" (extract the number only, remove "$" and spaces)
+    - "EACH OCCURRENCE $ 1,000,000" → each_occurrence: "1,000,000"
+    - "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ 2,000,000" → products_comp_op_agg: "2,000,000"
+    - **FLEXIBLE PATTERN MATCHING**: Also look for variations:
+      * "PRODUCTS & COMPLETED OPERATIONS AGGREGATE" (with "&")
+      * "PRODUCTS / COMPLETED OPERATIONS AGGREGATE" (with "/")
+      * "PRODUCTS" followed by "COMPLETED OPERATIONS" followed by "AGGREGATE" (may be on same line or adjacent lines)
+      * Search for "PRODUCTS" and then look for "COMPLETED OPERATIONS" and "AGGREGATE" nearby
+    - "PERSONAL & ADVERTISING INJURY $ 1,000,000" → personal_adv_injury: "1,000,000"
+    - "DAMAGE TO RENTED PREMISES (each occurrence) $ 100,000" → damage_to_rented_premises: "100,000"
+    - "MEDICAL EXPENSE (Any one person) $ 5,000" → med_exp: "5,000"
+  * **IMPORTANT**: The text may have OCR errors or formatting issues - look for the limit name followed by "$" and a number
+  * **VERIFY**: After extraction, check that you found ALL limit values - if any are null, search the text again more carefully
+  * "LIMIT APPLIES PER" checkboxes (POLICY, PROJECT, LOCATION) indicate aggregate application - extract which one is checked
 - Extract ALL coverages that are present WITH DATA (do not invent, but do not skip valid ones).
 - Return as a nested object under key "coverages".
-- Each coverage object MUST include policy_number/policy_eff/policy_exp for that line if present.
+- Each coverage object MUST include policy_number/policy_eff/policy_exp if present in the document.
 
 **⛔⛔⛔ CRITICAL ANTI-HALLUCINATION RULE FOR COVERAGES ⛔⛔⛔**
-- ONLY include coverages that have a ROW in the coverages table WITH ACTUAL DATA (policy numbers, limits, dates, etc.)
-- If a coverage row is BLANK or has NO limits/policy numbers/dates, DO NOT include it in the output
-- If a coverage is NOT listed in the table at all, DO NOT include it
-- **WHEN IN DOUBT, OMIT THE COVERAGE** - it's better to miss something than to invent it
-
-- **PRIMARY RULE - POLICY NUMBER REQUIRED**: 
-  - **A coverage MUST have a policy_number to be included** - if there's no policy number in the POLICY NUMBER column, DO NOT include that coverage at all
-  - Policy number is the PRIMARY indicator of whether a coverage is actually present - if it's missing, the coverage is not active
+- **For Certificates (ACORD 25)**: ONLY include coverages that have a ROW in the coverages table WITH ACTUAL DATA (policy numbers, limits, dates, etc.)
+  - A coverage MUST have a policy_number to be included - if there's no policy number in the POLICY NUMBER column, DO NOT include that coverage at all
+  - Policy number is the PRIMARY indicator of whether a coverage is actually present
   - Limits alone are NOT sufficient - if there's no policy number, the row is likely incomplete/template/hidden text → OMIT IT
-  - **VERIFY**: Before including any coverage, ask: "Does this row have a REAL, VISIBLE policy number in the POLICY NUMBER column?" If NO → OMIT IT
+
+- **For Section Forms**: ONLY include coverages that are CHECKED/MARKED in the COVERAGES section AND have corresponding LIMITS data
+  - If "COMMERCIAL GENERAL LIABILITY" checkbox is checked AND there are limits shown (GENERAL AGGREGATE, EACH OCCURRENCE, etc.), include it
+  - If a coverage checkbox is unchecked or missing, DO NOT include it
+  - If limits are shown but the coverage checkbox is not checked, DO NOT include it
+  - **VERIFY**: Before including any coverage, ask: "Is the coverage checkbox checked AND are there limits shown?" If NO → OMIT IT
+
+- If a coverage row/section is BLANK or has NO limits/policy numbers/dates, DO NOT include it in the output
+- If a coverage is NOT listed at all, DO NOT include it
+- **WHEN IN DOUBT, OMIT THE COVERAGE** - it's better to miss something than to invent it
 
 - **SPECIAL RULE FOR WORKERS COMPENSATION - EXTRA STRICT**: 
   - Workers Comp is OFTEN template text/hidden text that appears in both pdfplumber and PyMuPDF but is NOT actually on the certificate
@@ -207,8 +250,9 @@ Return ONLY a valid JSON object with:
   - If "WORKERS COMPENSATION" row exists but has no policy number → DO NOT include workers_compensation
 
 **⚠️⚠️⚠️ CRITICAL - EXTRACT ALL COVERAGES WITH DATA ⚠️⚠️⚠️**
-- **DO NOT SKIP ANY COVERAGE** that has a policy number (policy number is required, limits are secondary)
-- **Check for ALL possible coverage types** in the table:
+- **For Certificates**: DO NOT SKIP ANY COVERAGE that has a policy number (policy number is required, limits are secondary)
+- **For Section Forms**: DO NOT SKIP ANY COVERAGE that has a checked checkbox AND limits shown
+- **Check for ALL possible coverage types**:
   ✓ Commercial General Liability (CGL)
   ✓ Automobile Liability
   ✓ Umbrella Liability / Excess Liability
@@ -217,33 +261,35 @@ Return ONLY a valid JSON object with:
   ✓ Liquor Liability
   ✓ Garagekeepers Liability
   ✓ Any other coverage types present
-- **If a coverage has a policy number OR limits, you MUST include it** - do not skip it
-- **Example**: If you see "UMBRELLA LIAB" with policy "20 SBA AV6JXA" and limits "$2,000,000", you MUST include umbrella_liability in the output
+- **If a coverage has a policy number (certificates) OR is checked with limits (section forms), you MUST include it** - do not skip it
+- **Example (Certificate)**: If you see "UMBRELLA LIAB" with policy "20 SBA AV6JXA" and limits "$2,000,000", you MUST include umbrella_liability in the output
+- **Example (Section Form)**: If you see "COMMERCIAL GENERAL LIABILITY" checked with "GENERAL AGGREGATE $ 2,000,000" and "EACH OCCURRENCE $ 1,000,000", you MUST include commercial_general_liability with all the limits
 - **Before returning, verify**: Did I check for ALL coverage types? Did I extract every coverage that has data?
 
 Coverage keys to use (only when present WITH DATA):
 
 A) commercial_general_liability:
 {
-  "policy_number": "...",
-  "policy_eff": "MM/DD/YYYY or null",
-  "policy_exp": "MM/DD/YYYY or null",
-  "additional_insured": true/false/null,  # Extract from "ADDL INSD" column - "Y" = true, blank/unchecked = false
+  "policy_number": "...",  # May be null for section forms (applications) - extract from "POLICY NUMBER" field if present
+  "policy_eff": "MM/DD/YYYY or null",  # Extract from "EFFECTIVE DATE" field (section forms) or "POLICY EFF" column (certificates)
+  "policy_exp": "MM/DD/YYYY or null",  # Extract from "EXPIRATION DATE" field or calculate as 1 year from effective (e.g., 9/16/2025 → 9/16/2026)
+  "additional_insured": true/false/null,  # Extract from "ADDL INSD" column (certificates) or form fields (section forms)
   "claims_made": true/false/null,
   "occur": true/false/null,
-  **CRITICAL**: In the table, if "OCCUR" appears checked/marked, set "occur": true and "claims_made": false.
-  If "CLAIMS-MADE" appears checked/marked, set "claims_made": true and "occur": false.
-  Read the table row carefully - the checked checkbox indicates which one is true.
-  "general_aggregate_applies_per": "POLICY|PROJECT|LOC|null",
+  **CRITICAL**: 
+  - For certificates: In the table, if "OCCUR" appears checked/marked, set "occur": true and "claims_made": false. If "CLAIMS-MADE" appears checked/marked, set "claims_made": true and "occur": false.
+  - For section forms: Look for "CLAIMS MADE" and "OCCURRENCE" checkboxes in the COVERAGES section. If "OCCURRENCE" is checked, set "occur": true and "claims_made": false. If "CLAIMS MADE" is checked, set "claims_made": true and "occur": false.
+  Read the checkboxes carefully - the checked checkbox indicates which one is true.
+  "general_aggregate_applies_per": "POLICY|PROJECT|LOC|null",  # For section forms, extract from "LIMIT APPLIES PER" checkboxes (POLICY, PROJECT, LOCATION). For certificates, extract from table.
   "limits": {
-    "each_occurrence": "string or null",
-    "damage_to_rented_premises": "string or null",
-    "med_exp": "string or null",
-    "personal_adv_injury": "string or null",
-    "general_aggregate": "string or null",
-    "products_comp_op_agg": "string or null"
+    "each_occurrence": "string or null",  # For section forms: Search text for "EACH OCCURRENCE" followed by "$" and extract the number (e.g., "1,000,000"). For certificates: Extract from table column.
+    "damage_to_rented_premises": "string or null",  # For section forms: Search text for "DAMAGE TO RENTED PREMISES" followed by "$" and extract the number (e.g., "100,000").
+    "med_exp": "string or null",  # For section forms: Search text for "MEDICAL EXPENSE" followed by "$" and extract the number (e.g., "5,000").
+    "personal_adv_injury": "string or null",  # For section forms: Search text for "PERSONAL & ADVERTISING INJURY" or "PERSONAL & ADVERTISING INJURY" followed by "$" and extract the number (e.g., "1,000,000").
+    "general_aggregate": "string or null",  # For section forms: Search text for "GENERAL AGGREGATE" followed by "$" and extract the number (e.g., "2,000,000"). For certificates: Extract from table column.
+    "products_comp_op_agg": "string or null"  # For section forms: Search text for "PRODUCTS" followed by "COMPLETED OPERATIONS" and "AGGREGATE" (may be on same line or adjacent lines). Also try variations: "PRODUCTS & COMPLETED OPERATIONS AGGREGATE", "PRODUCTS / COMPLETED OPERATIONS AGGREGATE", or "PRODUCTS" + "COMPLETED OPERATIONS" + "AGGREGATE" patterns. Extract the number after "$" (e.g., "2,000,000"). For certificates: Extract from table column.
   },
-  "deductible_or_retention": "string or null"
+  "deductible_or_retention": "string or null"  # Extract from "DEDUCTIBLES" section if present
 }
 
 B) automobile_liability:
@@ -411,8 +457,12 @@ NOTE: NO additional_insured_name or additional_insureds fields at all
 ==================================================
 EXTRACTION SOURCE 1: PDFPLUMBER (Table-aware) - PRIMARY SOURCE
 ==================================================
-**PRIORITY**: Use the TABLE sections (especially TABLE 2) for coverage data extraction.
-The tables preserve structure and are more reliable than raw text.
+**PRIORITY**: 
+- For CERTIFICATES: Use the TABLE sections (especially TABLE 2) for coverage data extraction.
+- For SECTION FORMS: The limits may appear in TABLE sections OR in the TEXT section. Check BOTH.
+  * If you see "COMMERCIAL GENERAL LIABILITY SECTION", search the TEXT section for limit values
+  * Look for patterns like "GENERAL AGGREGATE $ 2,000,000" in the text
+  * The tables preserve structure, but section forms may have limits in free-form text
 
 """ + pdfplumber_text + """
 
@@ -422,6 +472,20 @@ EXTRACTION SOURCE 2: PYMUPDF (Text layer) - CROSS-VALIDATION
 **USE AS**: Fallback/cross-reference when pdfplumber data is unclear or missing.
 
 """ + pymupdf_text + """
+
+==================================================
+CRITICAL REMINDER FOR SECTION FORMS
+==================================================
+If this is a SECTION FORM (you see "COMMERCIAL GENERAL LIABILITY SECTION"):
+- Limits are in the TEXT, NOT in tables
+- Search for patterns like "GENERAL AGGREGATE $ 2,000,000" in the text above
+- Extract the numbers: "2,000,000", "1,000,000", "100,000", "5,000", etc.
+- **For PRODUCTS & COMPLETED OPERATIONS AGGREGATE**: Use flexible pattern matching:
+  * Look for "PRODUCTS" followed by "COMPLETED OPERATIONS" and "AGGREGATE" (may be on same or adjacent lines)
+  * Try variations: "PRODUCTS & COMPLETED OPERATIONS AGGREGATE" or "PRODUCTS / COMPLETED OPERATIONS AGGREGATE"
+  * Search for "PRODUCTS" and then look for "COMPLETED OPERATIONS" and "AGGREGATE" nearby
+- DO NOT return null for limits if you see these patterns in the text
+- The limits are clearly visible - extract them!
 
 Return ONLY the JSON object now."""
         else:
@@ -618,12 +682,12 @@ def main():
     # Get input file
     if len(sys.argv) < 2:
         print("⚠️  No input provided, using default: wilkes_gl")
-        base_name = "qm_gl"
+        base_name = "westside_gla"
     else:
         base_name = sys.argv[1]
     
     # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
-    carrier_dir = "travelerop"
+    carrier_dir = "nationwideop"
     
     # Look for the combo file (best extraction)
     # NOTE: for GL we typically use base names like "aaniya_gl" so the file becomes "aaniya_gl_combo.txt"

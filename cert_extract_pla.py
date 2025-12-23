@@ -450,37 +450,64 @@ def extract_pages_from_content(content: str) -> List[Tuple[int, str]]:
     return pages
 
 
-def combine_extractions(tesseract_file: Path, pymupdf_file: Path, 
+def combine_extractions(pdfplumber_file: Path, pymupdf_file: Path, tesseract_file: Path,
                        output_file: Path, interleave_pages: bool = True) -> bool:
     """
-    Combine Tesseract and PyMuPDF extraction files
+    Combine pdfplumber, PyMuPDF, and Tesseract extraction files
     """
-    if not tesseract_file.exists():
-        print(f"⚠️  Tesseract file not found: {tesseract_file}")
-        return False
-    if not pymupdf_file.exists():
-        print(f"⚠️  PyMuPDF file not found: {pymupdf_file}")
+    files_to_check = []
+    if pdfplumber_file.exists():
+        files_to_check.append(("pdfplumber", pdfplumber_file))
+    if pymupdf_file.exists():
+        files_to_check.append(("pymupdf", pymupdf_file))
+    if tesseract_file.exists():
+        files_to_check.append(("tesseract", tesseract_file))
+    
+    if not files_to_check:
+        print("⚠️  No extraction files found to combine")
         return False
     
     print("="*60)
     print("COMBINING EXTRACTIONS")
     print("="*60)
-    print(f"Tesseract: {tesseract_file}")
-    print(f"PyMuPDF:   {pymupdf_file}")
-    print(f"Output:    {output_file}\n")
+    if pdfplumber_file.exists():
+        print(f"pdfplumber: {pdfplumber_file}")
+    if pymupdf_file.exists():
+        print(f"PyMuPDF:    {pymupdf_file}")
+    if tesseract_file.exists():
+        print(f"Tesseract:  {tesseract_file}")
+    print(f"Output:     {output_file}\n")
     
-    # Read both files
-    with open(tesseract_file, 'r', encoding='utf-8') as f:
-        tesseract_content = f.read()
+    # Read all available files
+    pdfplumber_content = ""
+    pymupdf_content = ""
+    tesseract_content = ""
     
-    with open(pymupdf_file, 'r', encoding='utf-8') as f:
-        pymupdf_content = f.read()
+    if pdfplumber_file.exists():
+        with open(pdfplumber_file, 'r', encoding='utf-8') as f:
+            pdfplumber_content = f.read()
+    
+    if pymupdf_file.exists():
+        with open(pymupdf_file, 'r', encoding='utf-8') as f:
+            pymupdf_content = f.read()
+    
+    if tesseract_file.exists():
+        with open(tesseract_file, 'r', encoding='utf-8') as f:
+            tesseract_content = f.read()
     
     combined_content = []
     
     # Header
+    sources = []
+    if pdfplumber_content:
+        sources.append("PDFPLUMBER")
+    if pymupdf_content:
+        sources.append("PYMUPDF")
+    if tesseract_content:
+        sources.append("TESSERACT")
+    
     combined_content.append("="*80)
-    combined_content.append("COMBINED EXTRACTION - TESSERACT + PYMUPDF")
+    combined_content.append(f"COMBINED EXTRACTION - {' + '.join(sources)}")
     combined_content.append("="*80)
     combined_content.append("")
     
@@ -488,16 +515,23 @@ def combine_extractions(tesseract_file: Path, pymupdf_file: Path,
         # Page-by-page interleaving mode
         print("Mode: Page-by-page interleaving")
         
-        tesseract_pages = extract_pages_from_content(tesseract_content)
-        pymupdf_pages = extract_pages_from_content(pymupdf_content)
+        pdfplumber_pages = extract_pages_from_content(pdfplumber_content) if pdfplumber_content else []
+        pymupdf_pages = extract_pages_from_content(pymupdf_content) if pymupdf_content else []
+        tesseract_pages = extract_pages_from_content(tesseract_content) if tesseract_content else []
         
-        tesseract_dict = {page_num: content for page_num, content in tesseract_pages}
+        pdfplumber_dict = {page_num: content for page_num, content in pdfplumber_pages}
         pymupdf_dict = {page_num: content for page_num, content in pymupdf_pages}
+        tesseract_dict = {page_num: content for page_num, content in tesseract_pages}
         
-        all_pages = sorted(set(list(tesseract_dict.keys()) + list(pymupdf_dict.keys())))
+        all_pages = sorted(set(
+            list(pdfplumber_dict.keys()) + 
+            list(pymupdf_dict.keys()) + 
+            list(tesseract_dict.keys())
+        ))
         
-        print(f"   Found {len(tesseract_pages)} Tesseract pages")
+        print(f"   Found {len(pdfplumber_pages)} pdfplumber pages")
         print(f"   Found {len(pymupdf_pages)} PyMuPDF pages")
+        print(f"   Found {len(tesseract_pages)} Tesseract pages")
         print(f"   Combining {len(all_pages)} unique pages\n")
         
         for page_num in all_pages:
@@ -506,24 +540,34 @@ def combine_extractions(tesseract_file: Path, pymupdf_file: Path,
             combined_content.append("="*80)
             combined_content.append("")
             
-            if page_num in tesseract_dict:
-                combined_content.append("--- TESSERACT (Buffer=1) ---")
+            if page_num in pdfplumber_dict:
+                combined_content.append("--- PDFPLUMBER (Table-aware) ---")
                 combined_content.append("")
-                combined_content.append(tesseract_dict[page_num])
+                combined_content.append(pdfplumber_dict[page_num])
                 combined_content.append("")
-            else:
-                combined_content.append("--- TESSERACT (Buffer=1) ---")
-                combined_content.append("[Page not found in Tesseract extraction]")
+            elif pdfplumber_content:
+                combined_content.append("--- PDFPLUMBER (Table-aware) ---")
+                combined_content.append("[Page not found in pdfplumber extraction]")
                 combined_content.append("")
             
             if page_num in pymupdf_dict:
-                combined_content.append("--- PYMUPDF (Buffer=0) ---")
+                combined_content.append("--- PYMUPDF (Text layer) ---")
                 combined_content.append("")
                 combined_content.append(pymupdf_dict[page_num])
                 combined_content.append("")
-            else:
-                combined_content.append("--- PYMUPDF (Buffer=0) ---")
+            elif pymupdf_content:
+                combined_content.append("--- PYMUPDF (Text layer) ---")
                 combined_content.append("[Page not found in PyMuPDF extraction]")
+                combined_content.append("")
+            
+            if page_num in tesseract_dict:
+                combined_content.append("--- TESSERACT (OCR) ---")
+                combined_content.append("")
+                combined_content.append(tesseract_dict[page_num])
+                combined_content.append("")
+            elif tesseract_content:
+                combined_content.append("--- TESSERACT (OCR) ---")
+                combined_content.append("[Page not found in Tesseract extraction]")
                 combined_content.append("")
             
             combined_content.append("")
@@ -531,27 +575,42 @@ def combine_extractions(tesseract_file: Path, pymupdf_file: Path,
         # Simple concatenation mode
         print("Mode: Simple concatenation\n")
         
-        combined_content.append("="*80)
-        combined_content.append("SOURCE 1: TESSERACT EXTRACTION (Buffer=1)")
-        combined_content.append("="*80)
-        combined_content.append("")
-        combined_content.append(tesseract_content)
-        combined_content.append("")
-        combined_content.append("="*80)
-        combined_content.append("END OF TESSERACT EXTRACTION")
-        combined_content.append("="*80)
-        combined_content.append("")
-        combined_content.append("")
+        if pdfplumber_content:
+            combined_content.append("="*80)
+            combined_content.append("SOURCE 1: PDFPLUMBER EXTRACTION (Table-aware)")
+            combined_content.append("="*80)
+            combined_content.append("")
+            combined_content.append(pdfplumber_content)
+            combined_content.append("")
+            combined_content.append("="*80)
+            combined_content.append("END OF PDFPLUMBER EXTRACTION")
+            combined_content.append("="*80)
+            combined_content.append("")
+            combined_content.append("")
         
-        combined_content.append("="*80)
-        combined_content.append("SOURCE 2: PYMUPDF EXTRACTION (Buffer=0)")
-        combined_content.append("="*80)
-        combined_content.append("")
-        combined_content.append(pymupdf_content)
-        combined_content.append("")
-        combined_content.append("="*80)
-        combined_content.append("END OF PYMUPDF EXTRACTION")
-        combined_content.append("="*80)
+        if pymupdf_content:
+            combined_content.append("="*80)
+            combined_content.append("SOURCE 2: PYMUPDF EXTRACTION (Text layer)")
+            combined_content.append("="*80)
+            combined_content.append("")
+            combined_content.append(pymupdf_content)
+            combined_content.append("")
+            combined_content.append("="*80)
+            combined_content.append("END OF PYMUPDF EXTRACTION")
+            combined_content.append("="*80)
+            combined_content.append("")
+            combined_content.append("")
+        
+        if tesseract_content:
+            combined_content.append("="*80)
+            combined_content.append("SOURCE 3: TESSERACT EXTRACTION (OCR)")
+            combined_content.append("="*80)
+            combined_content.append("")
+            combined_content.append(tesseract_content)
+            combined_content.append("")
+            combined_content.append("="*80)
+            combined_content.append("END OF TESSERACT EXTRACTION")
+            combined_content.append("="*80)
     
     # Write combined file
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -593,7 +652,7 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "westside_pl"
+        input_name = "westside_pla"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
     
@@ -622,17 +681,18 @@ def main():
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
     
-    tesseract_output = output_dir / f"{base_name}1.txt"
+    pdfplumber_output = output_dir / f"{base_name}1.txt"
     pymupdf_output = output_dir / f"{base_name}2.txt"
+    tesseract_output = output_dir / f"{base_name}3.txt"
     combined_output = output_dir / f"{base_name}_combo.txt"
     
     total_start = time.time()
     
-    # Run Tesseract extraction
+    # Run pdfplumber extraction
     print("\n" + "="*80)
-    print("STEP 1: TESSERACT EXTRACTION")
+    print("STEP 1: PDFPLUMBER EXTRACTION")
     print("="*80)
-    tesseract_success = extract_tesseract(pdf_path, tesseract_output, n_jobs=n_jobs)
+    pdfplumber_success = extract_with_pdfplumber(pdf_path, pdfplumber_output)
     
     # Run PyMuPDF extraction
     print("\n" + "="*80)
@@ -641,12 +701,18 @@ def main():
     pymupdf_success = extract_pymupdf(pdf_path, pymupdf_output, 
                                       use_ocr=not skip_ocr, force_ocr=force_ocr)
     
-    # Auto-combine if both extractions succeeded
-    if tesseract_success and pymupdf_success:
+    # Run Tesseract extraction
+    print("\n" + "="*80)
+    print("STEP 3: TESSERACT EXTRACTION")
+    print("="*80)
+    tesseract_success = extract_tesseract(pdf_path, tesseract_output, n_jobs=n_jobs)
+    
+    # Auto-combine if at least one extraction succeeded
+    if pdfplumber_success or pymupdf_success or tesseract_success:
         print("\n" + "="*80)
-        print("STEP 3: COMBINING EXTRACTIONS")
+        print("STEP 4: COMBINING EXTRACTIONS")
         print("="*80)
-        combine_extractions(tesseract_output, pymupdf_output, combined_output)
+        combine_extractions(pdfplumber_output, pymupdf_output, tesseract_output, combined_output)
     
     total_time = time.time() - total_start
     
@@ -657,12 +723,17 @@ def main():
     print(f"⏱️  Total time: {total_time:.2f} seconds")
     print()
     print("Output files:")
-    if tesseract_success:
-        print(f"  ✅ Tesseract: {tesseract_output}")
+    if pdfplumber_success:
+        print(f"  ✅ pdfplumber: {pdfplumber_output}")
+        json_file = pdfplumber_output.with_suffix('.tables.json')
+        if json_file.exists():
+            print(f"  ✅ Tables JSON: {json_file}")
     if pymupdf_success:
-        print(f"  ✅ PyMuPDF:   {pymupdf_output}")
-    if tesseract_success and pymupdf_success:
-        print(f"  ✅ Combined:  {combined_output}")
+        print(f"  ✅ PyMuPDF:     {pymupdf_output}")
+    if tesseract_success:
+        print(f"  ✅ Tesseract:   {tesseract_output}")
+    if pdfplumber_success or pymupdf_success or tesseract_success:
+        print(f"  ✅ Combined:    {combined_output}")
     print("="*80)
 
 

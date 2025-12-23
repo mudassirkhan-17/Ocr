@@ -30,7 +30,7 @@ load_dotenv()
 class GLLimitsValidator:
     """Validate GL certificate limit fields against policy text (single LLM call)."""
 
-    def __init__(self, model: str = "gpt-4o-mini"):
+    def __init__(self, model: str = "gpt-4.1-mini"):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY not found in environment variables")
@@ -248,13 +248,51 @@ class GLLimitsValidator:
                 elif s == "NOT_FOUND":
                     nf += 1
             return {"total": t, "matched": m, "mismatched": mm, "not_found": nf}
+        
+        def _count_addresses(arr: List[Dict]) -> Dict[str, int]:
+            t = 0
+            m = 0
+            mm = 0
+            nf = 0
+            for v in arr or []:
+                t += 1
+                s = (v.get("status") or "").upper()
+                if s == "MATCH":
+                    m += 1
+                elif s == "MISMATCH":
+                    mm += 1
+                elif s == "NOT_FOUND":
+                    nf += 1
+            return {"total": t, "matched": m, "mismatched": mm, "not_found": nf}
+        
+        def _count_coverages(arr: List[Dict]) -> Dict[str, int]:
+            t = 0
+            present = 0
+            not_present = 0
+            for v in arr or []:
+                t += 1
+                s = (v.get("status") or "").upper()
+                if s == "PRESENT":
+                    present += 1
+                elif s == "NOT_PRESENT":
+                    not_present += 1
+            return {"total": t, "present": present, "not_present": not_present}
 
+        addresses = _count_addresses(results.get("address_validations", []))
+        coverages = _count_coverages(results.get("coverage_presence_validations", []))
         cgl = _count(results.get("cgl_limit_validations", []))
         umb = _count(results.get("umbrella_limit_validations", []))
         epl = _count(results.get("epl_limit_validations", []))
         liquor = _count(results.get("liquor_limit_validations", []))
 
         results["summary"] = {
+            "addresses_total": addresses["total"],
+            "addresses_matched": addresses["matched"],
+            "addresses_mismatched": addresses["mismatched"],
+            "addresses_not_found": addresses["not_found"],
+            "coverages_total": coverages["total"],
+            "coverages_present": coverages["present"],
+            "coverages_not_present": coverages["not_present"],
             "total_limits": cgl["total"] + umb["total"] + epl["total"] + liquor["total"],
             "matched": cgl["matched"] + umb["matched"] + epl["matched"] + liquor["matched"],
             "mismatched": cgl["mismatched"] + umb["mismatched"] + epl["mismatched"] + liquor["mismatched"],
@@ -264,6 +302,38 @@ class GLLimitsValidator:
             "total_epl_limits": epl["total"],
             "total_liquor_limits": liquor["total"],
         }
+
+    def extract_all_coverages(self, cert_data: Dict) -> List[Dict]:
+        """
+        Extract all coverages present in the certificate for presence validation.
+        Returns list of coverage objects with their names and policy numbers.
+        """
+        coverages = cert_data.get("coverages", {}) or {}
+        coverage_list = []
+        
+        coverage_mapping = {
+            "commercial_general_liability": "Commercial General Liability",
+            "automobile_liability": "Automobile Liability",
+            "umbrella_liability": "Umbrella Liability",
+            "excess_liability": "Excess Liability",
+            "workers_compensation": "Workers Compensation",
+            "employment_practices_liability": "Employment Practices Liability",
+            "liquor_liability": "Liquor Liability",
+            "garagekeepers_liability": "Garagekeepers Liability",
+        }
+        
+        for key, display_name in coverage_mapping.items():
+            cov = coverages.get(key, {}) or {}
+            if cov and cov.get("policy_number"):  # Only include if has policy number
+                coverage_list.append({
+                    "coverage_key": key,
+                    "coverage_name": display_name,
+                    "policy_number": cov.get("policy_number"),
+                    "policy_eff": cov.get("policy_eff"),
+                    "policy_exp": cov.get("policy_exp"),
+                })
+        
+        return coverage_list
 
     def create_validation_prompt(
         self,
@@ -275,7 +345,7 @@ class GLLimitsValidator:
         policy_text: str,
     ) -> str:
         insured_name = cert_data.get("insured_name", "Not specified")
-        mailing_address = cert_data.get("mailing_address", "Not specified")
+        mailing_address = cert_data.get("mailing_address", None)
         location_address = cert_data.get("location_address", None)
 
         coverages = cert_data.get("coverages", {}) or {}
@@ -283,14 +353,36 @@ class GLLimitsValidator:
         umb = coverages.get("umbrella_liability", {}) or coverages.get("excess_liability", {}) or {}
         epl = coverages.get("employment_practices_liability", {}) or {}
         liquor = coverages.get("liquor_liability", {}) or {}
+        
+        all_coverages = self.extract_all_coverages(cert_data)
 
         prompt = f"""You are an expert Commercial General Liability (CGL) QC Specialist.
 
 Return ONLY valid JSON.
 
 ==================================================
-TASK
+TASK - VALIDATION ORDER
 ==================================================
+Validate in this order:
+
+1) ADDRESS VALIDATION (FIRST):
+- Validate mailing_address from certificate against policy
+  - Search policy for the mailing address (if certificate has one)
+  - Return MATCH if found (same or very similar), MISMATCH if different address found, NOT_FOUND if not in policy
+- Validate location_address from certificate against policy
+  - Search policy for the location address (if certificate has one)
+  - Return MATCH if found (same or very similar), MISMATCH if different address found, NOT_FOUND if not in policy
+- **CRITICAL**: If certificate has null/empty address, skip that address validation (don't include in output)
+
+2) COVERAGE PRESENCE VALIDATION (SECOND):
+- Check if ALL coverages present in the certificate also exist in the policy
+- For each coverage in the certificate:
+  - Search policy for the coverage by policy number OR coverage name
+  - Verify the coverage exists in the policy document
+  - Return PRESENT if found, NOT_PRESENT if missing from policy
+- **CRITICAL**: Only check coverages that have a policy_number in the certificate (ignore blank/incomplete coverages)
+
+3) LIMIT VALIDATION (THIRD):
 Validate the following GL LIMITS from the GL certificate against the policy document:
 
 1) Commercial General Liability (CGL) limits:
@@ -327,8 +419,11 @@ IMPORTANT:
 CERTIFICATE CONTEXT
 ==================================================
 Insured Name: {insured_name}
-Mailing Address: {mailing_address}
-Location Address (if shown): {location_address if location_address else "Not shown"}
+Mailing Address: {mailing_address if mailing_address else "Not specified (null)"}
+Location Address: {location_address if location_address else "Not specified (null)"}
+
+ALL COVERAGES FROM CERTIFICATE (to check presence in policy):
+{json.dumps(all_coverages, indent=2)}
 
 Commercial General Liability (from certificate extraction): 
 {json.dumps(cgl, indent=2)}
@@ -371,6 +466,27 @@ OUTPUT FORMAT
 Return ONLY this JSON object:
 
 {{
+  "address_validations": [
+    {{
+      "address_type": "mailing_address | location_address",
+      "cert_value": "Address from certificate or null",
+      "status": "MATCH | MISMATCH | NOT_FOUND",
+      "policy_value": "Address from policy or null",
+      "evidence": "Quote showing the address (OCR_SOURCE, Page X) or null",
+      "notes": "Explain why MATCH/MISMATCH/NOT_FOUND"
+    }}
+  ],
+  "coverage_presence_validations": [
+    {{
+      "coverage_key": "commercial_general_liability | umbrella_liability | workers_compensation | employment_practices_liability | liquor_liability | etc.",
+      "coverage_name": "Display name (e.g., 'Commercial General Liability')",
+      "cert_policy_number": "Policy number from certificate",
+      "status": "PRESENT | NOT_PRESENT",
+      "policy_policy_number": "Policy number from policy (if found) or null",
+      "evidence": "Quote showing the coverage exists (OCR_SOURCE, Page X) or null",
+      "notes": "Explain why PRESENT/NOT_PRESENT"
+    }}
+  ],
   "cgl_limit_validations": [
     {{
       "cert_limit_key": "each_occurrence | damage_to_rented_premises | med_exp | personal_adv_injury | general_aggregate | products_comp_op_agg",
@@ -421,6 +537,13 @@ Return ONLY this JSON object:
     }}
   ],
   "summary": {{
+    "addresses_total": 0,
+    "addresses_matched": 0,
+    "addresses_mismatched": 0,
+    "addresses_not_found": 0,
+    "coverages_total": 0,
+    "coverages_present": 0,
+    "coverages_not_present": 0,
     "total_limits": 0,
     "matched": 0,
     "mismatched": 0,
@@ -444,15 +567,33 @@ Return ONLY this JSON object:
         with open(cert_json_path, "r", encoding="utf-8") as f:
             cert_data = json.load(f)
 
+        all_coverages = self.extract_all_coverages(cert_data)
         cgl_items = self.extract_cgl_limits(cert_data)
         umbrella_items = self.extract_umbrella_limits(cert_data)
         epl_items = self.extract_epl_limits(cert_data)
         liquor_items = self.extract_liquor_limits(cert_data)
 
-        if not cgl_items and not umbrella_items and not epl_items and not liquor_items:
-            print("      ❌ No supported GL limit items found in certificate extraction JSON.")
-            print("      Ensure llm_gl.py extracted limits under coverages.commercial_general_liability / umbrella_liability / employment_practices_liability / liquor_liability.")
+        if not all_coverages:
+            print("      ❌ No coverages found in certificate extraction JSON.")
             return
+        
+        print(f"      Found {len(all_coverages)} coverage(s) to validate presence:")
+        for cov in all_coverages:
+            print(f"        - {cov['coverage_name']}: {cov['policy_number']}")
+        
+        # Check if we have addresses to validate
+        mailing_address = cert_data.get("mailing_address")
+        location_address = cert_data.get("location_address")
+        address_count = (1 if mailing_address else 0) + (1 if location_address else 0)
+        if address_count > 0:
+            print(f"      Found {address_count} address(es) to validate:")
+            if mailing_address:
+                print(f"        - Mailing Address: {mailing_address}")
+            if location_address:
+                print(f"        - Location Address: {location_address}")
+        
+        if not cgl_items and not umbrella_items and not epl_items and not liquor_items:
+            print("      ⚠️  No limit items found - will only validate addresses and coverage presence.")
 
         if cgl_items:
             print(f"      Found {len(cgl_items)} CGL limit item(s):")
@@ -541,7 +682,79 @@ Return ONLY this JSON object:
         print("✓ Validation completed successfully!")
 
     def display_results(self, results: Dict) -> None:
-        def _print_section(title: str, arr: List[Dict]) -> None:
+        def _print_address_section(title: str, arr: List[Dict]) -> None:
+            if not arr:
+                return
+            print("=" * 70)
+            print(title)
+            print("=" * 70 + "\n")
+            for v in arr:
+                status = v.get("status", "UNKNOWN")
+                addr_type = v.get("address_type", "N/A")
+                cert_value = v.get("cert_value", "N/A")
+                policy_value = v.get("policy_value", "N/A")
+                evidence = v.get("evidence", None)
+                notes = v.get("notes", "")
+
+                if status == "MATCH":
+                    icon = "✓"
+                elif status == "MISMATCH":
+                    icon = "✗"
+                else:
+                    icon = "?"
+
+                print(f"{icon} {addr_type.replace('_', ' ').title()}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Value: {cert_value}")
+                print(f"  Policy Value: {policy_value}")
+                if evidence:
+                    e = evidence
+                    if len(e) > 140:
+                        e = e[:137] + "..."
+                    print(f"  Evidence: {e}")
+                if notes:
+                    n = notes
+                    if len(n) > 180:
+                        n = n[:177] + "..."
+                    print(f"  Notes: {n}")
+                print()
+        
+        def _print_coverage_section(title: str, arr: List[Dict]) -> None:
+            if not arr:
+                return
+            print("=" * 70)
+            print(title)
+            print("=" * 70 + "\n")
+            for v in arr:
+                status = v.get("status", "UNKNOWN")
+                coverage_name = v.get("coverage_name", "N/A")
+                cert_policy = v.get("cert_policy_number", "N/A")
+                policy_policy = v.get("policy_policy_number", "N/A")
+                evidence = v.get("evidence", None)
+                notes = v.get("notes", "")
+
+                if status == "PRESENT":
+                    icon = "✓"
+                else:
+                    icon = "✗"
+
+                print(f"{icon} {coverage_name}")
+                print(f"  Status: {status}")
+                print(f"  Certificate Policy Number: {cert_policy}")
+                print(f"  Policy Policy Number: {policy_policy}")
+                if evidence:
+                    e = evidence
+                    if len(e) > 140:
+                        e = e[:137] + "..."
+                    print(f"  Evidence: {e}")
+                if notes:
+                    n = notes
+                    if len(n) > 180:
+                        n = n[:177] + "..."
+                    print(f"  Notes: {n}")
+                print()
+        
+        def _print_limit_section(title: str, arr: List[Dict]) -> None:
             if not arr:
                 return
             print("=" * 70)
@@ -584,27 +797,42 @@ Return ONLY this JSON object:
                     print(f"  Notes: {n}")
                 print()
 
-        _print_section("CGL LIMIT VALIDATION RESULTS", results.get("cgl_limit_validations", []) or [])
-        _print_section("UMBRELLA LIMIT VALIDATION RESULTS", results.get("umbrella_limit_validations", []) or [])
-        _print_section("EPL LIMIT VALIDATION RESULTS", results.get("epl_limit_validations", []) or [])
-        _print_section("LIQUOR LIABILITY LIMIT VALIDATION RESULTS", results.get("liquor_limit_validations", []) or [])
+        _print_address_section("ADDRESS VALIDATION RESULTS", results.get("address_validations", []) or [])
+        _print_coverage_section("COVERAGE PRESENCE VALIDATION RESULTS", results.get("coverage_presence_validations", []) or [])
+        _print_limit_section("CGL LIMIT VALIDATION RESULTS", results.get("cgl_limit_validations", []) or [])
+        _print_limit_section("UMBRELLA LIMIT VALIDATION RESULTS", results.get("umbrella_limit_validations", []) or [])
+        _print_limit_section("EPL LIMIT VALIDATION RESULTS", results.get("epl_limit_validations", []) or [])
+        _print_limit_section("LIQUOR LIABILITY LIMIT VALIDATION RESULTS", results.get("liquor_limit_validations", []) or [])
 
         summary = results.get("summary", {}) or {}
         print("=" * 70)
         print("SUMMARY")
         print("=" * 70)
-        print(f"Total Limits:  {summary.get('total_limits', 0)}")
-        print(f"  ✓ Matched:      {summary.get('matched', 0)}")
-        print(f"  ✗ Mismatched:   {summary.get('mismatched', 0)}")
-        print(f"  ? Not Found:    {summary.get('not_found', 0)}")
-        if "total_cgl_limits" in summary:
-            print(f"\nTotal CGL Limits:      {summary.get('total_cgl_limits', 0)}")
-        if "total_umbrella_limits" in summary:
-            print(f"Total Umbrella Limits: {summary.get('total_umbrella_limits', 0)}")
-        if "total_epl_limits" in summary:
-            print(f"Total EPL Limits:      {summary.get('total_epl_limits', 0)}")
-        if "total_liquor_limits" in summary:
-            print(f"Total Liquor Limits:   {summary.get('total_liquor_limits', 0)}")
+        
+        if summary.get("addresses_total", 0) > 0:
+            print(f"Addresses:  {summary.get('addresses_total', 0)}")
+            print(f"  ✓ Matched:      {summary.get('addresses_matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('addresses_mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('addresses_not_found', 0)}")
+        
+        if summary.get("coverages_total", 0) > 0:
+            print(f"\nCoverages:  {summary.get('coverages_total', 0)}")
+            print(f"  ✓ Present:      {summary.get('coverages_present', 0)}")
+            print(f"  ✗ Not Present:  {summary.get('coverages_not_present', 0)}")
+        
+        if summary.get("total_limits", 0) > 0:
+            print(f"\nTotal Limits:  {summary.get('total_limits', 0)}")
+            print(f"  ✓ Matched:      {summary.get('matched', 0)}")
+            print(f"  ✗ Mismatched:   {summary.get('mismatched', 0)}")
+            print(f"  ? Not Found:    {summary.get('not_found', 0)}")
+            if "total_cgl_limits" in summary:
+                print(f"\nTotal CGL Limits:      {summary.get('total_cgl_limits', 0)}")
+            if "total_umbrella_limits" in summary:
+                print(f"Total Umbrella Limits: {summary.get('total_umbrella_limits', 0)}")
+            if "total_epl_limits" in summary:
+                print(f"Total EPL Limits:      {summary.get('total_epl_limits', 0)}")
+            if "total_liquor_limits" in summary:
+                print(f"Total Liquor Limits:   {summary.get('total_liquor_limits', 0)}")
 
         qc_notes = results.get("qc_notes", None)
         if qc_notes:
@@ -617,9 +845,9 @@ Return ONLY this JSON object:
 
 def main() -> None:
     # ========== EDIT THESE VALUES ==========
-    carrier_dir = "nationwideop"        # encovaop, hartfordop, nationwideop, travelerop, ...
-    cert_prefix = "westside_gl"       # e.g. aaniya_gl, ambama_gl, evergreen_gl
-    policy_prefix = "westside"        # base name used for policy combo, e.g. aaniya -> aaniya_pol_combo.txt
+    carrier_dir = "encovaop"        # encovaop, hartfordop, nationwideop, travelerop, ...
+    cert_prefix = "aaniya_gl"       # e.g. aaniya_gl, ambama_gl, evergreen_gl
+    policy_prefix = "aaniya"        # base name used for policy combo, e.g. aaniya -> aaniya_pol_combo.txt
     # =======================================
 
     cert_json_path = os.path.join(carrier_dir, f"{cert_prefix}_extracted_real.json")
