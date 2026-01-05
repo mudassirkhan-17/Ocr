@@ -109,6 +109,50 @@ def process_single_page_tesseract(pdf_path: str, page_num: int):
         return (page_num, None, str(e))
 
 
+def process_single_page_tesseract_psm3(pdf_path: str, page_num: int):
+    """Process a single page with Tesseract OCR using PSM 3 (for fallback)"""
+    try:
+        image = pdf_page_to_image(pdf_path, page_num, dpi=100)
+        custom_config = r'--oem 1 --psm 3 -c preserve_interword_spaces=1'
+        text = pytesseract.image_to_string(image, config=custom_config)
+        return (page_num, text, None)
+    except Exception as e:
+        return (page_num, None, str(e))
+
+
+def _is_text_gibberish_or_empty(text: str, min_length: int = 10, gibberish_threshold: float = 0.3) -> bool:
+    """Check if text is null, empty, gibberish, or mostly whitespace"""
+    if not text or len(text.strip()) < min_length:
+        return True
+    
+    sample = text[:500] if len(text) > 500 else text
+    
+    # Check for mostly whitespace (spaces, tabs, newlines)
+    non_whitespace = sum(1 for c in sample if not c.isspace())
+    if non_whitespace / len(sample) < 0.1:  # Less than 10% actual content = mostly whitespace
+        return True
+    
+    # Check for non-printable characters (excluding newlines/tabs)
+    non_printable = sum(1 for c in sample if ord(c) < 32 and c not in '\n\r\t')
+    ratio = non_printable / len(sample) if sample else 0
+    
+    if ratio > gibberish_threshold:
+        return True
+    
+    # Check for actual English letters (a-z, A-Z) - most important for readability
+    english_letters = sum(1 for c in sample if c.isalpha() and ord(c) < 128)
+    if english_letters / len(sample) < 0.2:  # Less than 20% English letters = likely corrupted
+        return True
+    
+    # Check for too many special/weird characters (corrupted OCR artifacts)
+    # Count characters that are not: letters, digits, common punctuation, spaces
+    weird_chars = sum(1 for c in sample if not (c.isalnum() or c in '.,;:!?()-\'" \n\r\t' or ord(c) < 128))
+    if weird_chars / len(sample) > 0.3:  # More than 30% weird chars = corrupted
+        return True
+    
+    return False
+
+
 def extract_tesseract(pdf_path: Path, output_path: Path, n_jobs: int = -1, max_pages: Optional[int] = None) -> bool:
     """
     Extract text from PDF using Tesseract OCR
@@ -236,9 +280,11 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Optional[Path] = None,
 
 def extract_pymupdf(pdf_path: Path, output_path: Path, 
                     use_ocr: bool = True, force_ocr: bool = False,
-                    max_pages: Optional[int] = None) -> bool:
+                    max_pages: Optional[int] = None,
+                    n_jobs: int = -1) -> bool:
     """
-    Extract text from PDF using PyMuPDF (optionally with OCRmyPDF preprocessing)
+    Extract text from PDF using PyMuPDF
+    Falls back to Tesseract PSM 3 if PyMuPDF extraction is corrupted/gibberish
     
     Args:
         pdf_path: Path to PDF file
@@ -246,6 +292,7 @@ def extract_pymupdf(pdf_path: Path, output_path: Path,
         use_ocr: If True, run OCRmyPDF first to make PDF searchable
         force_ocr: If True, force OCR on all pages
         max_pages: Process only first N pages (None = all pages)
+        n_jobs: Number of parallel workers (-1 for all cores) for fallback
     """
     if not PYMUPDF_AVAILABLE:
         print("❌ PyMuPDF extraction skipped (dependencies not available)")
@@ -255,22 +302,19 @@ def extract_pymupdf(pdf_path: Path, output_path: Path,
     print("PYMUPDF EXTRACTION")
     print("="*60)
     
-    # Step 1: OCR if needed
-    if use_ocr:
-        ocr_pdf = run_ocrmypdf(pdf_path, force_ocr=force_ocr)
-        if not ocr_pdf:
-            print("⚠️  OCR failed, trying direct extraction...")
-            ocr_pdf = pdf_path
-    else:
-        ocr_pdf = pdf_path
-    
-    print(f"Input:  {ocr_pdf}")
+    # Strategy: Try original PDF first (may already have text)
+    # Only use OCR if original has no/minimal text
+    # This avoids OCRmyPDF corruption issues
+    print(f"Input:  {pdf_path}")
     print(f"Output: {output_path}\n")
+    print("Strategy: Extract from original PDF (skip OCRmyPDF to avoid corruption)")
+    print("Note: Tesseract pipeline already handles OCR separately\n")
     
     start_time = time.time()
     
     try:
-        doc = fitz.open(ocr_pdf)
+        # Extract directly from original PDF (no OCR preprocessing)
+        doc = fitz.open(pdf_path)
         total_pages = len(doc)
         
         # Limit pages if requested
@@ -282,32 +326,130 @@ def extract_pymupdf(pdf_path: Path, output_path: Path,
             print(f"✅ PDF has {num_pages} pages\n")
         
         all_text = []
+        corrupted_pages = 0
         for page_num in range(num_pages):
             print(f"Extracting page {page_num + 1}/{num_pages}...", end=" ", flush=True)
             page = doc[page_num]
-            text = page.get_text()
+            
+            # Try multiple extraction methods for better OCR text handling
+            text = None
+            
+            # Method 1: Try "dict" mode - most reliable for OCR'd PDFs
+            try:
+                text_dict = page.get_text("dict")
+                text_blocks = []
+                for block in text_dict.get("blocks", []):
+                    if "lines" in block:
+                        for line in block["lines"]:
+                            line_text = " ".join(span.get("text", "") for span in line.get("spans", []))
+                            if line_text.strip():
+                                text_blocks.append(line_text)
+                text = "\n".join(text_blocks)
+                # Validate text quality - check for too many non-printable characters
+                if text:
+                    sample = text[:500] if len(text) > 500 else text
+                    non_printable = sum(1 for c in sample if ord(c) < 32 and c not in '\n\r\t')
+                    if non_printable > len(sample) * 0.2:  # More than 20% non-printable = likely corrupted
+                        text = None
+            except Exception as e:
+                text = None
+            
+            # Method 2: Try explicit "text" mode
+            if not text or len(text.strip()) == 0:
+                try:
+                    text = page.get_text("text")
+                    # Validate text quality
+                    if text:
+                        sample = text[:500] if len(text) > 500 else text
+                        non_printable = sum(1 for c in sample if ord(c) < 32 and c not in '\n\r\t')
+                        if non_printable > len(sample) * 0.2:
+                            text = None
+                except:
+                    text = None
+            
+            # Method 3: Fallback to default get_text()
+            if not text or len(text.strip()) == 0:
+                try:
+                    text = page.get_text()
+                except:
+                    text = ""
+            
+            # Clean up any remaining encoding issues
+            if text:
+                # Remove or replace problematic characters
+                text = ''.join(c if (ord(c) >= 32 or c in '\n\r\t') else ' ' for c in text)
+                # Collapse multiple spaces
+                text = re.sub(r' +', ' ', text)
+            
+            # Check if this page's text is corrupted/gibberish
+            if _is_text_gibberish_or_empty(text):
+                corrupted_pages += 1
+            
             all_text.append(f"\n{'='*60}\nPAGE {page_num + 1}\n{'='*60}\n{text}")
             print(f"✅ ({len(text)} chars)")
         
         doc.close()
         
-        # Save extracted text
+        # Check overall quality
+        total_chars = sum(len(t) for t in all_text)
+        corruption_ratio = corrupted_pages / num_pages if num_pages > 0 else 0
+        
+        # If PyMuPDF is corrupted, fallback to Tesseract PSM 3
+        if corruption_ratio > 0.5 or total_chars < 1000:
+            print(f"\n⚠️  PyMuPDF extraction appears corrupted:")
+            print(f"   - {corrupted_pages}/{num_pages} pages corrupted ({corruption_ratio*100:.1f}%)")
+            print(f"   - Total characters: {total_chars:,}")
+            print(f"   - Falling back to Tesseract PSM 3...")
+            
+            if not TESSERACT_AVAILABLE:
+                print("❌ Tesseract not available for fallback")
+                return False
+            
+            # Run Tesseract PSM 3 extraction
+            print(f"\nRunning Tesseract PSM 3 extraction (fallback)...")
+            
+            if JOBLIB_AVAILABLE:
+                results = Parallel(n_jobs=n_jobs, verbose=10)(
+                    delayed(process_single_page_tesseract_psm3)(str(pdf_path), page_num)
+                    for page_num in range(1, num_pages + 1)
+                )
+            else:
+                results = [process_single_page_tesseract_psm3(str(pdf_path), page_num) 
+                           for page_num in range(1, num_pages + 1)]
+            
+            # Sort and build output
+            results.sort(key=lambda x: x[0])
+            all_text = []
+            
+            for page_num, text, error in results:
+                all_text.append(f"\n{'='*80}\n")
+                all_text.append(f"PAGE {page_num}\n")
+                all_text.append(f"{'='*80}\n")
+                
+                if error:
+                    all_text.append(f"\n[ERROR ON PAGE {page_num}: {error}]\n")
+                else:
+                    all_text.append(text)
+            
+            # Save Tesseract PSM 3 output
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(''.join(all_text))
+            
+            elapsed = time.time() - start_time
+            file_size = len(''.join(all_text))
+            print(f"\n✅ Tesseract PSM 3 fallback completed in {elapsed:.2f} seconds")
+            print(f"   Saved {file_size:,} characters ({file_size/1024:.2f} KB)")
+            return True
+        
+        # PyMuPDF was good, save it
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(all_text))
         
         elapsed = time.time() - start_time
-        total_chars = sum(len(t) for t in all_text)
-        
         print(f"\n✅ PyMuPDF extraction completed in {elapsed:.2f} seconds")
         print(f"   Saved {total_chars:,} characters ({total_chars/1024:.2f} KB)")
-        
-        # Clean up temp OCR file if we created one
-        if use_ocr and ocr_pdf != pdf_path and ocr_pdf.exists():
-            try:
-                ocr_pdf.unlink()
-            except:
-                pass
         
         return True
         
@@ -315,6 +457,45 @@ def extract_pymupdf(pdf_path: Path, output_path: Path,
         print(f"❌ Extraction failed: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Try Tesseract PSM 3 fallback even on exception
+        if TESSERACT_AVAILABLE:
+            print(f"\n⚠️  Attempting Tesseract PSM 3 fallback...")
+            try:
+                doc = fitz.open(pdf_path)
+                num_pages = min(len(doc), max_pages) if max_pages else len(doc)
+                doc.close()
+                
+                if JOBLIB_AVAILABLE:
+                    results = Parallel(n_jobs=n_jobs, verbose=10)(
+                        delayed(process_single_page_tesseract_psm3)(str(pdf_path), page_num)
+                        for page_num in range(1, num_pages + 1)
+                    )
+                else:
+                    results = [process_single_page_tesseract_psm3(str(pdf_path), page_num) 
+                               for page_num in range(1, num_pages + 1)]
+                
+                results.sort(key=lambda x: x[0])
+                all_text = []
+                for page_num, text, error in results:
+                    all_text.append(f"\n{'='*80}\n")
+                    all_text.append(f"PAGE {page_num}\n")
+                    all_text.append(f"{'='*80}\n")
+                    
+                    if error:
+                        all_text.append(f"\n[ERROR ON PAGE {page_num}: {error}]\n")
+                    else:
+                        all_text.append(text)
+                
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(''.join(all_text))
+                
+                print(f"✅ Tesseract PSM 3 fallback successful")
+                return True
+            except Exception as fallback_error:
+                print(f"❌ Fallback also failed: {fallback_error}")
+        
         return False
 
 
@@ -511,15 +692,15 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "znt_policy"
+        input_name = "arrr_policy"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
     
     # Input/output directories
     # - pdf_dir: where PDFs live (e.g., encova/, nationwide/, hartford/, traveler/)
     # - output_dir: where extracted txt files are written (e.g., encovaop/, nationwideop/, ...)
-    pdf_dir = "traveler"
-    carrier_dir = "travelerop"
+    pdf_dir = "usgnon"
+    carrier_dir = "usgnonop"
     
     # Extract base name
     base_name = extract_base_name(input_name)
@@ -563,7 +744,7 @@ def main():
     print("="*80)
     pymupdf_success = extract_pymupdf(pdf_path, pymupdf_output, 
                                       use_ocr=not skip_ocr, force_ocr=force_ocr,
-                                      max_pages=max_pages)
+                                      max_pages=max_pages, n_jobs=n_jobs)
     
     total_time = time.time() - total_start
     

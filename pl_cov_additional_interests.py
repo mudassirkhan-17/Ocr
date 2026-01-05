@@ -14,8 +14,8 @@ from openai import OpenAI
 # Load environment variables
 load_dotenv()
 
-# Regex to find pages with "additional insure*" (any suffix: insured, insureds, etc.)
-_ADDITIONAL_INSURE_RE = re.compile(r"additional\s+insure\w*", re.IGNORECASE)
+# Regex to find pages with "additional insure*" or "additional interests" (mortgagee, loss payee, etc.)
+_ADDITIONAL_INSURE_RE = re.compile(r"additional\s+(insure\w*|interests?)", re.IGNORECASE)
 
 
 def _split_policy_combo_into_pages(policy_text: str) -> List[Dict]:
@@ -39,10 +39,15 @@ def _split_policy_combo_into_pages(policy_text: str) -> List[Dict]:
 
 
 def _filter_pages_with_additional_insure(pages: List[Dict]) -> List[int]:
-    """Find all pages containing 'additional insure' (any suffix: insured, insureds, etc.)"""
+    """Find all pages containing 'additional insure*' or 'additional interests' or related terms (mortgagee, loss payee, etc.)"""
     out = []
+    # Also search for mortgagee, loss payee, lienholder keywords
+    additional_keywords = re.compile(
+        r"(additional\s+(insure\w*|interests?)|mortgagee|loss\s+payee|lienholder)", 
+        re.IGNORECASE
+    )
     for p in pages:
-        if _ADDITIONAL_INSURE_RE.search(p["text"]):
+        if additional_keywords.search(p["text"]):
             out.append(p["page_number"])
     return out
 
@@ -196,141 +201,194 @@ class AdditionalInterestsCoverageValidator:
         prompt = f"""You are an expert Property Insurance QC Specialist validating Additional Interests (Mortgagee, Loss Payee, Additional Insured).
 
 ==================================================
-⛔⛔⛔ ANTI-HALLUCINATION RULES (READ FIRST) ⛔⛔⛔
+🔴 CRITICAL EVIDENCE EXTRACTION RULES 🔴
 ==================================================
 
-**IF YOU CANNOT FIND SOMETHING, RETURN null OR "NOT_FOUND" - DO NOT HALLUCINATE**
+**YOU MUST FOLLOW THIS EXACT PROCESS FOR EACH ADDITIONAL INTEREST:**
 
-1. **WHEN SEARCHING FOR AN ADDITIONAL INTEREST:**
-   - Search thoroughly through the filtered policy text below
-   - If you CANNOT find it after careful search, return status="NOT_FOUND"
-   - Return null for all evidence fields
-   - Return null for all policy_* fields
-   - NEVER invent text or values that don't exist
+**STEP 1: SEARCH**
+- Scan the policy text below for the entity name
+- Look in: Additional Insured schedules, Mortgagee clauses, Loss Payee sections, Endorsements
+- Check both TESSERACT and PYMUPDF sources (one may be clearer than the other)
+- Search thoroughly - the entity may appear in multiple locations
 
-2. **WHEN YOU FIND A NAME BUT IT'S SLIGHTLY DIFFERENT:**
-   - Example: Certificate has "DGR GOLDING LLC", Policy has "DGR HOLDING LLC"
-   - Even if it's likely an OCR error, names don't match exactly
-   - Return status="MISMATCH" with match_type="NAME_VARIATION" (for informational purposes)
-   - Include both names in the response and note the OCR variation in notes
+**STEP 2: LOCATE THE PAGE NUMBER**
+- Find the PAGE marker in the text (e.g., "PAGE 143" or "PAGE 67")
+- The page number MUST come from these PAGE markers - DO NOT INVENT OR GUESS
+- If you see the entity but cannot find a clear PAGE marker nearby, search up/down in the text for the closest marker
 
-3. **CRITICAL - NEVER GUESS:**
-   - Do NOT invent additional interests
-   - Do NOT use "TO WHOM IT MAY CONCERN" as a valid interest
-   - If unclear, return NOT_FOUND
+**STEP 3: COPY EXACT TEXT (DO NOT PARAPHRASE)**
+- Copy the text WORD-FOR-WORD from the policy - no changes, no summaries
+- Include at least 15-30 words for proper context
+- Include the label/header if present (e.g., "Additional Insured:", "Mortgagee:")
+- DO NOT change, summarize, rephrase, or "clean up" ANY words
 
-4. **EVIDENCE REQUIREMENTS:**
-   - Evidence MUST be verbatim text from the policy
-   - Evidence MUST include page number (OCR_SOURCE, Page X)
-   - If you can't find evidence with page number, return null
+**STEP 4: VERIFY YOUR WORK BEFORE SUBMITTING**
+Ask yourself these questions:
+✓ Did I copy this text EXACTLY as written? (not paraphrased, not summarized)
+✓ Is the page number from an actual PAGE marker I can see in the text below?
+✓ Does the entity name appear in my copied text?
+✓ Did I include enough context (15-30 words minimum)?
+✓ Would someone be able to Ctrl+F and find this exact text on this page?
 
-**When in doubt, return NOT_FOUND with null values. This is better than hallucinating.**
+⛔ IF YOU CANNOT FIND THE ENTITY AFTER THOROUGH SEARCH:
+- Return status: "NOT_FOUND"
+- Set evidence: null
+- Set policy_interest_name: null
+- Set policy_interest_address: null
+- Set policy_interest_type: null
+- Set match_type: null
+- DO NOT INVENT, GUESS, OR PARAPHRASE
 
 ==================================================
-CRITICAL INSTRUCTIONS
+EVIDENCE EXAMPLES - STUDY THESE CAREFULLY
 ==================================================
 
-**YOUR TASK:**
-Validate Additional Interests from the certificate against the policy document.
+Certificate Entity: "DGR HOLDING LLC"
 
-**CONTEXT FROM CERTIFICATE:**
+✅ EXAMPLE 1 - EXCELLENT (Exact copy with full context):
+"Name Of Person(s) Or Organization(s) (Additional Insured): DGR HOLDING LLC, 123 MAIN STREET, ATLANTA, GA 30303. Coverage applies per the terms of this endorsement. (PYMUPDF, Page 143)"
+
+✅ EXAMPLE 2 - EXCELLENT (From schedule with context):
+"SCHEDULE OF ADDITIONAL INSUREDS: 1. DGR HOLDING LLC - 123 MAIN ST - ATLANTA GA 30303 - BLANKET ADDITIONAL INSURED 2. ABC COMPANY (TESSERACT, Page 67)"
+
+✅ EXAMPLE 3 - EXCELLENT (Mortgagee clause with surrounding text):
+"Loss Payable Clause: Loss, if any, under this policy shall be payable to DGR HOLDING LLC, 123 Main Street, Atlanta, GA 30303 as mortgagee as interest may appear. (PYMUPDF, Page 89)"
+
+✅ EXAMPLE 4 - GOOD (Endorsement with entity name):
+"This endorsement modifies insurance provided under COMMERCIAL GENERAL LIABILITY COVERAGE FORM. Additional Insured: DGR HOLDING LLC (TESSERACT, Page 145)"
+
+❌ EXAMPLE 1 - BAD (Paraphrased, not exact):
+"The policy lists DGR Holding LLC as an additional insured on page 143"
+PROBLEM: Paraphrased instead of word-for-word copy
+
+❌ EXAMPLE 2 - BAD (Missing page number):
+"Name Of Person(s) Or Organization(s) (Additional Insured): DGR HOLDING LLC"
+PROBLEM: No page number provided
+
+❌ EXAMPLE 3 - BAD (Invented page number):
+"DGR HOLDING LLC appears as additional insured (Page 143)"
+PROBLEM: Not a direct quote, page number may be invented, no actual text copied
+
+❌ EXAMPLE 4 - BAD (Insufficient context):
+"DGR HOLDING LLC (Page 143)"
+PROBLEM: Too short, no context, can't verify what this refers to
+
+❌ EXAMPLE 5 - BAD (Summarized):
+"Additional insured entity is listed in the schedule on page 67"
+PROBLEM: Summary instead of exact quote
+
+==================================================
+CONTEXT FROM CERTIFICATE
+==================================================
+
 - Insured Name: {insured_name}
 - Policy Number: {policy_number}
 - Location Address: {location_address}
 
-**ADDITIONAL INTERESTS FROM CERTIFICATE (YOU MUST FIND THESE IN POLICY):**
+==================================================
+CERTIFICATE ENTITIES TO FIND IN POLICY
+==================================================
+
 {json.dumps(cert_interests, indent=2) if cert_interests else "[] (No additional interests on certificate)"}
 
-**⚠️ SEARCH TASK:**
-For EACH interest above, search the filtered policy text below for:
-1. Exact name match (case-insensitive) → Return MATCH
-2. Similar names (e.g., "GOLDING" vs "HOLDING" due to OCR error) → Return MISMATCH (names don't match exactly)
-3. Look for patterns like "Name Of Person(s) Or Organization(s) (Additional Insured):" followed by the name
+For EACH entity above, you must:
+1. Search for it in the policy text below
+2. Copy the exact text where it appears (15-30 words minimum)
+3. Note the page number from the PAGE marker
+4. Note the OCR source (TESSERACT or PYMUPDF)
 
 ==================================================
-POLICY TEXT (FILTERED - ADDITIONAL INTERESTS SECTIONS ONLY)
+EVIDENCE EXTRACTION CHECKLIST
 ==================================================
 
-**⚠️⚠️⚠️ CRITICAL: This is a FILTERED extract containing ONLY pages/sections with additional interests. ⚠️⚠️⚠️**
+Before submitting each validation, verify:
 
-**THIS FILTERED TEXT CONTAINS THE ADDITIONAL INTERESTS - SEARCH IT THOROUGHLY!**
+**IF YOU FOUND THE ENTITY (STATUS = MATCH or MISMATCH):**
+□ I copied the text WORD-FOR-WORD (no paraphrasing)
+□ My copied text includes at least 15-30 words of context
+□ The entity name appears in my copied text
+□ I got the page number from a PAGE marker in the text
+□ I noted the OCR source (TESSERACT or PYMUPDF)
+□ I included the section label (e.g., "Additional Insured:", "Mortgagee:")
+□ Someone could find this exact text by searching the policy
 
-The text below has been pre-filtered to include ONLY:
-- Pages with "additional insured", "mortgagee", "loss payee" keywords
-- Pages with dollar amounts (schedules often have dollar values)
-- Neighboring pages for context
+**IF YOU DID NOT FIND THE ENTITY (STATUS = NOT_FOUND):**
+□ I searched thoroughly through all the filtered text
+□ I checked both TESSERACT and PYMUPDF sections
+□ I set all policy_* fields to null
+□ I set evidence to null
+□ I set match_type to null
+□ I did NOT invent or guess any information
 
-**SEARCH THIS FILTERED TEXT CAREFULLY - the additional interests ARE in here!**
+==================================================
+POLICY TEXT (FILTERED - ADDITIONAL INTERESTS SECTIONS)
+==================================================
 
-This policy document contains TWO OCR extraction sources per page:
-- **TESSERACT (Buffer=1)** - First OCR source
-- **PYMUPDF (Buffer=0)** - Second OCR source
+**⚠️ IMPORTANT: This is a FILTERED extract containing ONLY pages mentioning additional interests.**
 
-Use whichever source is clearer. ALWAYS cite which OCR source you used.
+The text below contains TWO OCR extraction sources per page:
+- **--- TESSERACT (Buffer=1) ---** sections
+- **--- PYMUPDF (Buffer=0) ---** sections
+
+Use whichever source is clearer for your evidence extraction.
+
+**SEARCH THIS FILTERED TEXT CAREFULLY:**
 
 {filtered_policy_text}
 
 ==================================================
-ADDITIONAL INTERESTS VALIDATION RULES
+SEARCH PATTERNS TO LOOK FOR
 ==================================================
 
-**SEARCH LOCATIONS (SEARCH THESE EXACT PATTERNS):**
-1. **Standalone Schedules:** "MORTGAGEE HOLDERS", "LOSS PAYEE SCHEDULE", "ADDITIONAL INTERESTS SCHEDULE"
-2. **Endorsement Schedules (MOST COMMON):** Look for CG 20 forms and endorsements containing:
-   - **EXACT PATTERN**: "Name Of Person(s) Or Organization(s) (Additional Insured):" followed by entity name on next line(s)
-   - **EXACT PATTERN**: "Additional Insured:" followed by entity name
-   - **EXACT PATTERN**: "Mortgagee:" or "Loss Payee:" followed by entity name
-3. **Mortgagee Clauses:** Mortgagee provisions in property forms
+Common patterns where additional interests appear:
 
-**⚠️ CRITICAL SEARCH PATTERN:**
-When you see this exact text:
-"Name Of Person(s) Or Organization(s) (Additional Insured):"
-The entity name appears IMMEDIATELY AFTER on the next line(s). Search for this pattern carefully!
+1. **Endorsement schedules (MOST COMMON):**
+   "Name Of Person(s) Or Organization(s) (Additional Insured):" [entity name on next lines]
+   "Additional Insured:" [entity name]
+   
+2. **Standalone schedules:**
+   "SCHEDULE OF ADDITIONAL INSUREDS"
+   "MORTGAGEE HOLDERS"
+   "LOSS PAYEE SCHEDULE"
+   
+3. **Mortgagee/Loss Payee clauses:**
+   "Mortgagee:" [entity name and address]
+   "Loss Payable to:" [entity name and address]
+   
+4. **Endorsement forms:**
+   Look for "CG 20" forms or endorsements with additional insured language
 
-**NAME MATCHING:**
-- **EXACT MATCH**: Names match exactly (case-insensitive) → status: "MATCH", match_type: "EXACT"
-- **NAME VARIATION (MISMATCH)**: Names are similar but NOT identical (likely OCR error):
-  - Examples: "GOLDING" vs "HOLDING" (1 letter difference) → status: "MISMATCH"
-  - Examples: "SMITH" vs "SMITHE" (common OCR error) → status: "MISMATCH"
-  - If names don't match exactly → status: "MISMATCH" (even if likely OCR error)
-  - Set match_type: "NAME_VARIATION" for informational purposes (to note OCR variation)
-- City/State/ZIP must match exactly; street format flexible
-- **CRITICAL**: "DGR GOLDING LLC" vs "DGR HOLDING LLC" = MISMATCH (names don't match exactly, even if likely same entity)
+==================================================
+NAME MATCHING RULES
+==================================================
 
-**VALIDATION LOGIC:**
-- If certificate has 0 interests and policy has 0 → MATCH
-- If certificate has interests but policy has none → MISMATCH
-- If certificate has none but policy has interests → MISMATCH (certificate missing policy interests)
-- If both have interests → Match each certificate interest to a policy interest:
-  - **EXACT match** (names identical, case-insensitive) → status: "MATCH"
-  - **NAME_VARIATION** (names similar but not identical, likely OCR error) → status: "MISMATCH" (with match_type: "NAME_VARIATION" for info)
-  - **No match found** → status: "NOT_FOUND"
+- **EXACT MATCH**: Names identical (case-insensitive) → status: "MATCH", match_type: "EXACT"
+- **NAME VARIATION**: Names similar but NOT identical → status: "MISMATCH", match_type: "NAME_VARIATION"
+  Examples: "GOLDING" vs "HOLDING", "SMITH" vs "SMITHE" (OCR errors)
+  Even if likely same entity, names don't match exactly = MISMATCH
+- **NOT FOUND**: Entity not in policy after thorough search → status: "NOT_FOUND", all fields null
 
 **CRITICAL:** "TO WHOM IT MAY CONCERN" is NOT a valid additional interest
 
 ==================================================
-OUTPUT FORMAT (WITH NULL VALUES FOR NOT FOUND)
+OUTPUT FORMAT - FOLLOW EXACTLY
 ==================================================
-
-⚠️ **IMPORTANT:** Use null for any field you cannot verify in the policy:
-- If NOT_FOUND: all policy_* fields = null, all evidence_* fields = null
-- Do NOT leave empty strings "" - use null instead
-- Do NOT invent page numbers
 
 Return ONLY a valid JSON object with this structure:
 
 {{
   "additional_interests_validations": [
     {{
-      "cert_interest_name": "Name from certificate (e.g., 'DGR GOLDING LLC')",
+      "cert_interest_name": "Entity name from certificate",
       "cert_interest_address": "Address from certificate or null",
       "status": "MATCH | MISMATCH | NOT_FOUND",
-      "policy_interest_name": "Name from policy or null",
-      "policy_interest_address": "Address from policy or null",
-      "policy_interest_type": "MORTGAGEE | LOSS_PAYEE | ADDITIONAL_INSURED | LIENHOLDER | OTHER | null",
-      "match_type": "EXACT | NAME_VARIATION | null",
-      "evidence": "Quote from policy (OCR_SOURCE, Page X) or null",
-      "notes": "Explanation of matching logic, OCR variations, or why NOT_FOUND"
+      "policy_interest_name": "Exact name from policy or null if NOT_FOUND",
+      "policy_interest_address": "Address from policy or null if NOT_FOUND",
+      "policy_interest_type": "MORTGAGEE | LOSS_PAYEE | ADDITIONAL_INSURED | LIENHOLDER | OTHER | null if NOT_FOUND",
+      "match_type": "EXACT | NAME_VARIATION | null if NOT_FOUND",
+      "evidence": "EXACT word-for-word quote (15-30 words minimum) from policy with (OCR_SOURCE, Page X) or null if NOT_FOUND",
+      "notes": "Explanation of match/mismatch/not found decision"
     }}
   ],
   "summary": {{
@@ -339,29 +397,34 @@ Return ONLY a valid JSON object with this structure:
     "additional_interests_mismatched": 0,
     "additional_interests_not_found": 0
   }},
-  "qc_notes": "Overall observations about the validation"
+  "qc_notes": "Overall observations"
 }}
 
-**STATUS DEFINITIONS:**
-- **MATCH**: Certificate interest found in policy with EXACT name match (case-insensitive) with evidence
-- **MISMATCH**: Names don't match exactly (even if similar/OCR variation) OR policy has different/additional interests than certificate
-- **NOT_FOUND**: Certificate interest not found in policy (set all policy_* and evidence fields to null)
+==================================================
+FINAL VERIFICATION BEFORE SUBMITTING
+==================================================
 
-⚠️ **CRITICAL CHECKLIST BEFORE RETURNING:**
-For each validation result, verify:
-✓ If NOT_FOUND: Are ALL policy_* fields set to null?
-✓ If NOT_FOUND: Are ALL evidence fields set to null?
-✓ If MATCH: Does evidence contain name + page number?
-✓ If MATCH with NAME_VARIATION: Are both names clearly shown?
-✓ Did I search thoroughly before declaring NOT_FOUND?
-✓ Did I avoid inventing values, page numbers, or evidence?
+For EACH validation, double-check:
 
-**EVIDENCE FORMAT:**
-Always include page number and OCR source, e.g.:
-- "Name Of Person(s) Or Organization(s) (Additional Insured): DGR HOLDING LLC (PYMUPDF, Page 143)"
-- "MORTGAGE HOLDERS schedule: ABC Bank, 123 Main St (TESSERACT, Page 68)"
+**IF STATUS = "MATCH" OR "MISMATCH":**
+✓ evidence contains EXACT copied text (not paraphrased)?
+✓ evidence includes 15-30 words minimum?
+✓ evidence includes page number from PAGE marker?
+✓ evidence includes OCR source (TESSERACT or PYMUPDF)?
+✓ policy_interest_name is filled in?
+✓ I can find this exact text in the policy above if I search for it?
 
-Return ONLY the JSON object. No other text.
+**IF STATUS = "NOT_FOUND":**
+✓ evidence is null (not empty string)?
+✓ policy_interest_name is null?
+✓ policy_interest_address is null?
+✓ policy_interest_type is null?
+✓ match_type is null?
+✓ I searched thoroughly before declaring NOT_FOUND?
+
+**Remember: It's better to return NOT_FOUND than to hallucinate or guess.**
+
+Return ONLY the JSON object now. No additional text or explanations.
 """
         
         return prompt
@@ -424,9 +487,9 @@ Return ONLY the JSON object. No other text.
         pages = _split_policy_combo_into_pages(policy_text)
         print(f"      Total pages: {len(pages)}")
         
-        # Simple approach: Find all pages containing "additional insure*" (any suffix)
+        # Find all pages containing "additional insure*", "additional interests", "mortgagee", "loss payee", etc.
         ai_pages = _filter_pages_with_additional_insure(pages)
-        print(f"      Pages with 'additional insure*': {len(ai_pages)} pages")
+        print(f"      Pages with additional interests/mortgagee/loss payee keywords: {len(ai_pages)} pages")
         
         # Expand to include neighboring pages for context
         expanded = _expand_neighbors(ai_pages, radius=1)
@@ -591,8 +654,8 @@ Return ONLY the JSON object. No other text.
 def main():
     """Main execution function"""
     # ========== EDIT THESE VALUES ==========
-    cert_prefix = "baltic"              # Change to: westside, james, etc.
-    carrier_dir = "encovaop"            # Change to: nationwideop, hartfordop, etc.
+    cert_prefix = "arrr"              # Change to: westside, james, etc.
+    carrier_dir = "usgnonop"            # Change to: nationwideop, hartfordop, etc.
     # =======================================
     
     # Construct paths

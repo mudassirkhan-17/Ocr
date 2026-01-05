@@ -263,12 +263,12 @@ def main():
     
     # Default input if not provided
     if input_name is None:
-        input_name = "baltic"
+        input_name = "arrr"
         print(f"⚠️  No input provided, using default: {input_name}")
         print()
     
     # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
-    carrier_dir = "encovaop"
+    carrier_dir = "usgnonop"
     
     # Extract base name
     base_name = extract_base_name(input_name)

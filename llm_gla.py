@@ -97,12 +97,13 @@ Cross-validate with PyMuPDF text when needed, but trust pdfplumber's structured 
   * **Section Form**: Coverage data is in a "COVERAGES" and "LIMITS" section with checkboxes and dollar amounts
 
 **⚠️⚠️⚠️ CRITICAL FOR SECTION FORMS - LIMIT EXTRACTION ⚠️⚠️⚠️**:
-- In section forms, limits appear as **TEXT PATTERNS**, NOT in structured tables
-- Look for lines like: "GENERAL AGGREGATE $ 2,000,000" or "EACH OCCURRENCE $ 1,000,000"
-- The format is: [LIMIT NAME] $ [AMOUNT] (e.g., "GENERAL AGGREGATE $ 2,000,000")
-- **YOU MUST SEARCH THE TEXT FOR THESE PATTERNS** - they are clearly visible in the extraction
-- Extract the NUMERIC VALUE ONLY (remove "$" and spaces) - e.g., "2,000,000" not "$ 2,000,000"
-- **DO NOT RETURN NULL** if you see these patterns in the text - extract them!
+- In section forms, limits appear as **TEXT PATTERNS** in TABLE sections (especially TABLE 2) OR in the TEXT section
+- **FIRST**: Check TABLE 2 for limit patterns like "GENERAL AGGREGATE $ 2,000,000" or "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ Included"
+- **THEN**: If not found in tables, search the TEXT section for the same patterns
+- The format is: [LIMIT NAME] $ [AMOUNT] (e.g., "GENERAL AGGREGATE $ 2,000,000" or "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ Included")
+- **YOU MUST SEARCH BOTH TABLE SECTIONS AND TEXT FOR THESE PATTERNS** - they are clearly visible in the extraction
+- Extract the NUMERIC VALUE ONLY (remove "$" and spaces) - e.g., "2,000,000" not "$ 2,000,000", OR "Included" if that's what appears
+- **DO NOT RETURN NULL** if you see these patterns in TABLE 2 or TEXT - extract them!
 - The limits may appear on the same line or across multiple lines - search carefully
 
 **CRITICAL - HIDDEN/TEMPLATE TEXT WARNING**:
@@ -196,11 +197,14 @@ Return ONLY a valid JSON object with:
 - **For Section Forms**: Extract from the "COVERAGES" and "LIMITS" sections where:
   * Checkboxes indicate which coverages are selected (e.g., "COMMERCIAL GENERAL LIABILITY" checked)
   * "CLAIMS MADE" vs "OCCURRENCE" checkboxes indicate the coverage type
-  * **CRITICAL**: Dollar amounts in the "LIMITS" section appear as TEXT, NOT in a table structure
-  * Look for these patterns in the text (they may appear on the same line or across multiple lines):
+  * **CRITICAL**: Dollar amounts in the "LIMITS" section appear as TEXT PATTERNS in TABLE sections (especially TABLE 2) OR in the TEXT section
+  * **FIRST**: Check TABLE 2 for limit patterns - they often appear there as text within table cells
+  * **THEN**: If not found in tables, look for these patterns in the TEXT section (they may appear on the same line or across multiple lines):
     - "GENERAL AGGREGATE $ 2,000,000" → general_aggregate: "2,000,000" (extract the number only, remove "$" and spaces)
     - "EACH OCCURRENCE $ 1,000,000" → each_occurrence: "1,000,000"
-    - "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ 2,000,000" → products_comp_op_agg: "2,000,000"
+    - "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ 2,000,000" → products_comp_op_agg: "2,000,000" (if it's a number)
+    - "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ Included" → products_comp_op_agg: "Included" (if it says "$ Included", extract "Included" - DO NOT confuse this with GENERAL AGGREGATE value)
+    - **CRITICAL**: PRODUCTS & COMPLETED OPERATIONS AGGREGATE is DIFFERENT from GENERAL AGGREGATE - do NOT use the GENERAL AGGREGATE value (2,000,000) for products_comp_op_agg. If PRODUCTS line shows "$ Included", use "Included". If it shows a number, use that number.
     - **FLEXIBLE PATTERN MATCHING**: Also look for variations:
       * "PRODUCTS & COMPLETED OPERATIONS AGGREGATE" (with "&")
       * "PRODUCTS / COMPLETED OPERATIONS AGGREGATE" (with "/")
@@ -209,7 +213,7 @@ Return ONLY a valid JSON object with:
     - "PERSONAL & ADVERTISING INJURY $ 1,000,000" → personal_adv_injury: "1,000,000"
     - "DAMAGE TO RENTED PREMISES (each occurrence) $ 100,000" → damage_to_rented_premises: "100,000"
     - "MEDICAL EXPENSE (Any one person) $ 5,000" → med_exp: "5,000"
-  * **IMPORTANT**: The text may have OCR errors or formatting issues - look for the limit name followed by "$" and a number
+  * **IMPORTANT**: The text may have OCR errors or formatting issues - look for the limit name followed by "$" and a number OR "Included". For PRODUCTS & COMPLETED OPERATIONS AGGREGATE, the value can be a number OR "Included" - do NOT confuse it with GENERAL AGGREGATE value.
   * **VERIFY**: After extraction, check that you found ALL limit values - if any are null, search the text again more carefully
   * "LIMIT APPLIES PER" checkboxes (POLICY, PROJECT, LOCATION) indicate aggregate application - extract which one is checked
 - Extract ALL coverages that are present WITH DATA (do not invent, but do not skip valid ones).
@@ -287,7 +291,7 @@ A) commercial_general_liability:
     "med_exp": "string or null",  # For section forms: Search text for "MEDICAL EXPENSE" followed by "$" and extract the number (e.g., "5,000").
     "personal_adv_injury": "string or null",  # For section forms: Search text for "PERSONAL & ADVERTISING INJURY" or "PERSONAL & ADVERTISING INJURY" followed by "$" and extract the number (e.g., "1,000,000").
     "general_aggregate": "string or null",  # For section forms: Search text for "GENERAL AGGREGATE" followed by "$" and extract the number (e.g., "2,000,000"). For certificates: Extract from table column.
-    "products_comp_op_agg": "string or null"  # For section forms: Search text for "PRODUCTS" followed by "COMPLETED OPERATIONS" and "AGGREGATE" (may be on same line or adjacent lines). Also try variations: "PRODUCTS & COMPLETED OPERATIONS AGGREGATE", "PRODUCTS / COMPLETED OPERATIONS AGGREGATE", or "PRODUCTS" + "COMPLETED OPERATIONS" + "AGGREGATE" patterns. Extract the number after "$" (e.g., "2,000,000"). For certificates: Extract from table column.
+    "products_comp_op_agg": "string or null"  # For section forms: Search text for "PRODUCTS" followed by "COMPLETED OPERATIONS" and "AGGREGATE" (may be on same line or adjacent lines). Also try variations: "PRODUCTS & COMPLETED OPERATIONS AGGREGATE", "PRODUCTS / COMPLETED OPERATIONS AGGREGATE", or "PRODUCTS" + "COMPLETED OPERATIONS" + "AGGREGATE" patterns. Extract the value after "$" - this can be a NUMBER (e.g., "2,000,000") OR "Included" (if it says "$ Included", extract "Included" as the value). For certificates: Extract from table column.
   },
   "deductible_or_retention": "string or null"  # Extract from "DEDUCTIBLES" section if present
 }
@@ -459,10 +463,10 @@ EXTRACTION SOURCE 1: PDFPLUMBER (Table-aware) - PRIMARY SOURCE
 ==================================================
 **PRIORITY**: 
 - For CERTIFICATES: Use the TABLE sections (especially TABLE 2) for coverage data extraction.
-- For SECTION FORMS: The limits may appear in TABLE sections OR in the TEXT section. Check BOTH.
-  * If you see "COMMERCIAL GENERAL LIABILITY SECTION", search the TEXT section for limit values
-  * Look for patterns like "GENERAL AGGREGATE $ 2,000,000" in the text
-  * The tables preserve structure, but section forms may have limits in free-form text
+- For SECTION FORMS: The limits may appear in TABLE sections OR in the TEXT section. Check BOTH, but START WITH TABLE sections.
+  * If you see "COMMERCIAL GENERAL LIABILITY SECTION", FIRST check TABLE 2 (or other table sections) for limit values like "GENERAL AGGREGATE $ 2,000,000" or "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ Included"
+  * If limits are not found in tables, THEN search the TEXT section for patterns like "GENERAL AGGREGATE $ 2,000,000"
+  * **CRITICAL**: For section forms, the limits ARE often in the TABLE sections - do not skip them! Extract from tables if that's where the data appears.
 
 """ + pdfplumber_text + """
 
@@ -477,13 +481,27 @@ EXTRACTION SOURCE 2: PYMUPDF (Text layer) - CROSS-VALIDATION
 CRITICAL REMINDER FOR SECTION FORMS
 ==================================================
 If this is a SECTION FORM (you see "COMMERCIAL GENERAL LIABILITY SECTION"):
-- Limits are in the TEXT, NOT in tables
-- Search for patterns like "GENERAL AGGREGATE $ 2,000,000" in the text above
-- Extract the numbers: "2,000,000", "1,000,000", "100,000", "5,000", etc.
-- **For PRODUCTS & COMPLETED OPERATIONS AGGREGATE**: Use flexible pattern matching:
-  * Look for "PRODUCTS" followed by "COMPLETED OPERATIONS" and "AGGREGATE" (may be on same or adjacent lines)
-  * Try variations: "PRODUCTS & COMPLETED OPERATIONS AGGREGATE" or "PRODUCTS / COMPLETED OPERATIONS AGGREGATE"
-  * Search for "PRODUCTS" and then look for "COMPLETED OPERATIONS" and "AGGREGATE" nearby
+- Limits appear in TABLE sections (especially TABLE 2) OR in the TEXT section - CHECK BOTH, START WITH TABLE 2
+- **MANDATORY FIRST STEP**: Look in TABLE 2 for these exact patterns:
+  * "GENERAL AGGREGATE $ 2,000,000" → extract "2,000,000"
+  * "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ Included" → extract "Included" (NOT "2,000,000")
+  * "EACH OCCURRENCE $ 1,000,000" → extract "1,000,000"
+  * "PERSONAL & ADVERTISING INJURY $ 1,000,000" → extract "1,000,000"
+  * "DAMAGE TO RENTED PREMISES (each occurrence) $ 100,000" → extract "100,000"
+  * "MEDICAL EXPENSE (Any one person) $ 5,000" → extract "5,000"
+- **THEN**: If not found in TABLE 2, search the TEXT section for the same patterns
+- **CRITICAL**: The limits ARE in TABLE 2 - do not skip it! Extract from TABLE 2 if that's where you see the patterns
+- Extract the numbers: "2,000,000", "1,000,000", "100,000", "5,000", etc. OR "Included" for products_comp_op_agg
+- **CRITICAL - PRODUCTS & COMPLETED OPERATIONS AGGREGATE**:
+  * This is DIFFERENT from GENERAL AGGREGATE - do NOT confuse them
+  * Look for "PRODUCTS & COMPLETED OPERATIONS AGGREGATE $ [VALUE]"
+  * The value can be a NUMBER (e.g., "2,000,000") OR "Included"
+  * If you see "$ Included", extract "Included" as the value
+  * DO NOT use the GENERAL AGGREGATE value (2,000,000) for products_comp_op_agg
+  * Use flexible pattern matching:
+    - Look for "PRODUCTS" followed by "COMPLETED OPERATIONS" and "AGGREGATE" (may be on same or adjacent lines)
+    - Try variations: "PRODUCTS & COMPLETED OPERATIONS AGGREGATE" or "PRODUCTS / COMPLETED OPERATIONS AGGREGATE"
+    - Search for "PRODUCTS" and then look for "COMPLETED OPERATIONS" and "AGGREGATE" nearby
 - DO NOT return null for limits if you see these patterns in the text
 - The limits are clearly visible - extract them!
 
@@ -682,12 +700,12 @@ def main():
     # Get input file
     if len(sys.argv) < 2:
         print("⚠️  No input provided, using default: wilkes_gl")
-        base_name = "westside_gla"
+        base_name = "naiya_gla"
     else:
         base_name = sys.argv[1]
     
     # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
-    carrier_dir = "nationwideop"
+    carrier_dir = "nonstandardop"
     
     # Look for the combo file (best extraction)
     # NOTE: for GL we typically use base names like "aaniya_gl" so the file becomes "aaniya_gl_combo.txt"

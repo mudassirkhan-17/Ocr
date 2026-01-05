@@ -618,12 +618,12 @@ def main():
     # Get input file
     if len(sys.argv) < 2:
         print("⚠️  No input provided, using default: wilkes_gl")
-        base_name = "qm_gl"
+        base_name = "naiya_gl"
     else:
         base_name = sys.argv[1]
     
     # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
-    carrier_dir = "travelerop"
+    carrier_dir = "nonstandardop"
     
     # Look for the combo file (best extraction)
     # NOTE: for GL we typically use base names like "aaniya_gl" so the file becomes "aaniya_gl_combo.txt"

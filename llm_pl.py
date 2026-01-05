@@ -473,12 +473,12 @@ def main():
     # Get input file
     if len(sys.argv) < 2:
         print("⚠️  No input provided, using default: james_pl")
-        base_name = "westside_pl"
+        base_name = "arrr_pl"
     else:
         base_name = sys.argv[1]
     
     # Carrier directory (change this to switch between nationwideop, encovaop, etc.)
-    carrier_dir = "nationwideop"
+    carrier_dir = "usgnonop"
     
     # Look for the combo file (best extraction)
     input_file = Path(f"{carrier_dir}/{base_name}_combo.txt")
